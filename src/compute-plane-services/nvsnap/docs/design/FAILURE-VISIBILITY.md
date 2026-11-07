@@ -245,7 +245,10 @@ The alerts rely on two changes in the agent:
   restart must not discard what its previous process had counted.
 
   So the counter carries a `boot` label, the process's start time, and the
-  agent exports `nvsnap_agent_start_time_seconds{boot}`. Each process is
+  agent exports `nvsnap_agent_start_time_seconds{boot}`. A rate needs the
+  same accounting for its denominator: `nvsnap_restores_total{boot,result}`
+  counts every restore that ran or could not run (`result` is `ok` or
+  `failed`), created at 0 at start like the failure counter. Each process is
   then its own series, and each series is judged by its own age:
 
   ```
@@ -269,7 +272,7 @@ The alerts rely on two changes in the agent:
 
 | Alert | Fires when |
 |---|---|
-| `NvsnapRestoreFailing` | Restores that ran or could not run are more than 20% failures over 30 minutes, and at least 3 failed |
+| `NvsnapRestoreFailing` | Over 30 minutes, more than 20% of `nvsnap_restores_total` is `result="failed"`, and at least 3 failed; both counted with the expression below |
 | `NvsnapCaptureFailing` | 3 or more failed, unverified or gpushare-failed captures in an hour |
 | `NvsnapUnexpectedCold` | Any cold or fallback admission with a reason that counts against nvsnap, in 30 minutes |
 | `NvsnapAdmissionErrors` | Any `decision="error"` admission in 15 minutes. These reach the API server as successes, so no webhook metric sees them |
@@ -289,13 +292,20 @@ this work adds under `docs/operate/`.
 A regression suite run answers "did nvsnap fail anything, and in which
 test" without anyone reading logs:
 
-- **Per test.** A test knows its function version id and when it started.
-  At teardown it reads the `NvsnapFunction` named by that version id
-  (`fnstatus.ObjectName`). It attaches each `failures` entry
-  timed after the test's start and naming a pod in the test's namespace.
-  nvsnap-server publishes a record's change within one reconcile (30 s by
-  default), so the hook polls for up to two intervals before it reads.
-  A failed test whose function has such an entry says so in its report.
+- **Per test, at the end of the run.** Each test records its function
+  version ids and its start and end times. Once every test is done, the
+  suite reads each version's `NvsnapFunction` (named by the version id,
+  `fnstatus.ObjectName`) and attaches to each test the `failures` entries
+  timed within its run and naming a pod in its namespace. A failed test
+  whose function has such an entry says so in its report.
+
+  Reading at the end, not at each test's teardown, leaves time for the
+  record's writes (retried for up to 5 minutes) and nvsnap-server's
+  projection (every 30 seconds by default). Failure records outlive the
+  test's function, so nothing is lost by waiting. A version whose record
+  is still being written when the suite reads is reported as
+  "attribution incomplete" when the per-run count below exceeds the
+  entries found.
 - **Per run.** At the end, the suite queries the cluster's metrics over the
   run's window and prints, next to the pass/fail summary:
   - nvsnap failures by kind, with §4's expression, so an agent that started
@@ -354,10 +364,10 @@ reasons are right.
 |---|---|
 | §2 | An error `Handler.Decide` admits unchanged, and a model-volume or election lookup error `Mutate` continues past, count `decision="error"`; a cache miss does not; each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
 | §3 | Each kind in the table appends one entry through its writer, including `failRestored`, the cachedir watcher and the seed result; two concurrent appends both land; a non-conflict API error is retried; the list keeps the newest 10; the projection keeps the order and `lastFailure`; a version with failures and no capture is projected
-| §4 | `nvsnap_failures_total` has every kind at 0 after start; repeated fail-open admissions answered with HTTP 200, with no instance leader admitted, fire `NvsnapAdmissionErrors`; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), old failures followed by a long scrape gap and no new failure (must not fire), failures scraped before an agent restart and none after (still counted), one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
+| §4 | `nvsnap_failures_total` has every kind at 0 after start; repeated fail-open admissions answered with HTTP 200, with no instance leader admitted, fire `NvsnapAdmissionErrors`; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), 20 successful and 3 failed restores before the first scrape (13%: `NvsnapRestoreFailing` does not fire), old failures followed by a long scrape gap and no new failure (must not fire), failures scraped before an agent restart and none after (still counted), one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
 | §3, every capture kind | A failure is on the version's failure record and projects onto `NvsnapFunction`, for: a CRIU group capture, a standalone CRIU capture, a cachedir-mode capture, a failed seed whose workload still starts, and a version that restores a shared capture it never made. The record survives a recapture and a reaper pass |
 | §3, admission | A cold start's `nvsnap.io/admission` annotation is appended once per pod UID; an agent restarted between the admission and the append replays it; a fail-open error admits the pod with only the annotation |
-| §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a run with the webhook made unreachable reports the API server's failed calls |
+| §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a failure-record write delayed past 60 seconds is still attributed; a run with the webhook made unreachable reports the API server's failed calls |
 
 ## Open questions
 
