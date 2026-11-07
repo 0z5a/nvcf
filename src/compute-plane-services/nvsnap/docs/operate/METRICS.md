@@ -167,8 +167,10 @@ The agent serves `/metrics` on its API port (8081, `http-api`), without
 authentication. The chart has the cluster's Prometheus keep it: on a
 cluster that serves the Prometheus Operator's ServiceMonitor API, it
 installs a ServiceMonitor for the agents. No step after the install is
-needed. The defaults follow the cluster monitoring convention of
-`examples/cluster-monitoring-sample`:
+needed. The defaults suit both collectors in this repository: the cluster
+Prometheus agent of `examples/cluster-monitoring-sample` (namespace
+`monitoring` and its discover label) and the `deploy/stacks/observability`
+collector (its `observability-target` label, any namespace):
 
 ```yaml
 agent:
@@ -178,6 +180,7 @@ agent:
       namespace: monitoring   # one whose monitors the cluster's Prometheus reads
       labels:                 # what that Prometheus selects monitors by
         prometheus.agent/servicemonitor-discover: "true"
+        nvcf.nvidia.com/observability-target: "true"
       interval: 30s
     dashboard:
       enabled: true     # a Grafana dashboard ConfigMap (grafana_dashboard: "1")
@@ -189,8 +192,8 @@ agent:
   can tell only on a live install; under `helm template` or a GitOps
   renderer it uses the configured namespace.
 - **A Prometheus that selects monitors differently.** Set `namespace` and
-  `labels` to what it reads. Remove the default label with
-  `prometheus.agent/servicemonitor-discover: null`.
+  `labels` to what it reads. Remove a default label by setting it to
+  `null`.
 
 To check that the agents are scraped, query `nvsnap_build_info` in the
 cluster's Prometheus: there is one series per agent.
