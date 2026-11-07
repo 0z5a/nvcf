@@ -166,11 +166,15 @@ listed starts cold.
 The agent serves `/metrics` on its API port (8081, `http-api`), without
 authentication. The chart has the cluster's Prometheus keep it: on a
 cluster that serves the Prometheus Operator's ServiceMonitor API, it
-installs a ServiceMonitor for the agents. No step after the install is
-needed. The defaults suit both collectors in this repository: the cluster
-Prometheus agent of `examples/cluster-monitoring-sample` (namespace
-`monitoring` and its discover label) and the `deploy/stacks/observability`
-collector (its `observability-target` label, any namespace):
+installs a ServiceMonitor for the agents. A collector that discovers
+ServiceMonitors then scrapes the agents with no step after the install.
+The defaults suit two such collectors:
+
+- a Prometheus Operator Prometheus that reads monitors in `monitoring`
+  labelled `prometheus.agent/servicemonitor-discover: "true"`, as the NVCA
+  monitor of `examples/cluster-monitoring-sample` expects;
+- the `deploy/stacks/observability` collector, which reads monitors
+  labelled `nvcf.nvidia.com/observability-target: "true"` in any namespace.
 
 ```yaml
 agent:
@@ -194,6 +198,15 @@ agent:
 - **A Prometheus that selects monitors differently.** Set `namespace` and
   `labels` to what it reads. Remove a default label by setting it to
   `null`.
+
+- **A collector that does not read ServiceMonitors.** The OpenTelemetry
+  collector of `examples/cluster-monitoring-sample/otel-collector-k8s.yaml`
+  has its own scrape jobs. Add one for the agents: Kubernetes endpoints of
+  the `nvsnap-agent` Service in the release's namespace, port `http-api`,
+  path `/metrics`.
+- **An installer that may not read namespaces.** The chart looks up the
+  configured namespace before using it. Set `namespace: ""` to use the
+  release's namespace without a lookup.
 
 To check that the agents are scraped, query `nvsnap_build_info` in the
 cluster's Prometheus: there is one series per agent.
