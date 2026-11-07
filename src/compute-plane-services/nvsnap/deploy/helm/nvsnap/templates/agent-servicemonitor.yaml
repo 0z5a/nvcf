@@ -26,7 +26,10 @@ metadata:
   {{- /* A namespace the cluster lacks would fail the install: use the
        release's instead. lookup answers only against a live cluster; under
        helm template or a GitOps renderer it finds nothing, not even
-       kube-system, and the configured namespace stands. */}}
+       kube-system, and the configured namespace stands. A Forbidden
+       lookup would fail the install, but cannot happen: the agent's
+       ClusterRole (agent-rbac.yaml) grants get on namespaces, and Kubernetes lets only
+       an installer that holds that permission create it. */}}
   {{- $smNS := $sm.namespace | default .Release.Namespace }}
   {{- if and (lookup "v1" "Namespace" "" "kube-system") (not (lookup "v1" "Namespace" "" $smNS)) }}{{ $smNS = .Release.Namespace }}{{ end }}
   namespace: {{ $smNS }}
