@@ -41,8 +41,9 @@ pass "helm template renders"
 # The agents' ServiceMonitor selects exactly one Service, the headless
 # nvsnap-agent: a selector matching none scrapes nothing, one matching the
 # node-local Service too scrapes every agent twice.
+SM_API=monitoring.coreos.com/v1/ServiceMonitor
 SM_RENDER=$(helm template "$RELEASE" "$CHART" --namespace "$NS" \
-  --set agent.metrics.serviceMonitor.enabled=true --set agent.hostNetwork=false) \
+  --api-versions "$SM_API" --set agent.hostNetwork=false) \
   || fail "helm template with the ServiceMonitor failed"
 echo "$SM_RENDER" | python3 -c '
 import sys, yaml
@@ -50,6 +51,12 @@ docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
 sm = [d for d in docs if d["kind"] == "ServiceMonitor" and d["metadata"]["name"] == "nvsnap-agent"]
 if len(sm) != 1:
     sys.exit("want one nvsnap-agent ServiceMonitor, got %d" % len(sm))
+# By default it goes where the cluster monitoring convention puts monitors
+# (examples/cluster-monitoring-sample), with the label that selects them.
+if sm[0]["metadata"]["namespace"] != "monitoring":
+    sys.exit("ServiceMonitor in namespace %s, want monitoring" % sm[0]["metadata"]["namespace"])
+if sm[0]["metadata"]["labels"].get("prometheus.agent/servicemonitor-discover") != "true":
+    sys.exit("ServiceMonitor lacks the prometheus.agent/servicemonitor-discover label")
 sel = sm[0]["spec"]["selector"]["matchLabels"]
 port = sm[0]["spec"]["endpoints"][0]["port"]
 hit = [d["metadata"]["name"] for d in docs if d["kind"] == "Service"
@@ -63,9 +70,20 @@ cr = [d for d in docs if d["kind"] == "ClusterRole" and d["metadata"]["name"] ==
 if not any("events" in r.get("resources", []) and "create" in r.get("verbs", []) for r in cr[0]["rules"]):
     sys.exit("the nvsnap-agent ClusterRole cannot create events")
 ' || fail "agent ServiceMonitor or its events rule is wrong"
-RENDER_DEFAULT_SM=$(grep -c 'kind: ServiceMonitor' <<<"$RENDER" || true)
-[[ "$RENDER_DEFAULT_SM" == 0 ]] || fail "a ServiceMonitor renders by default"
-pass "agent ServiceMonitor selects the nvsnap-agent Service only, off by default; the agent may create events"
+# enabled: auto (the default) follows the cluster's API; true and false
+# override it.
+sm_count() { helm template "$RELEASE" "$CHART" --namespace "$NS" "$@" | grep -c '^kind: ServiceMonitor' || true; }
+[[ "$(grep -c '^kind: ServiceMonitor' <<<"$RENDER" || true)" == 0 ]] \
+  || fail "a ServiceMonitor renders on a cluster without the ServiceMonitor API"
+[[ "$(sm_count --api-versions "$SM_API" --set agent.metrics.serviceMonitor.enabled=false)" == 0 ]] \
+  || fail "enabled=false still renders a ServiceMonitor"
+[[ "$(sm_count --set agent.metrics.serviceMonitor.enabled=true)" == 1 ]] \
+  || fail "enabled=true does not render a ServiceMonitor without the API"
+NOLABEL=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --api-versions "$SM_API" \
+  --set 'agent.metrics.serviceMonitor.labels.prometheus\.agent/servicemonitor-discover=null') \
+  || fail "helm template with the default label dropped failed"
+! grep -q 'servicemonitor-discover' <<<"$NOLABEL" || fail "the default label cannot be dropped"
+pass "agent ServiceMonitor selects the nvsnap-agent Service only, renders where the cluster serves the API, in monitoring with the discover label; the agent may create events"
 
 # 2. ClusterRole 'nvsnap-server' has the nvsnap.io rule block (nvsnap#54)
 # Split the rendered output on '---\n' (YAML doc separators), then
