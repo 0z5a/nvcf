@@ -176,9 +176,14 @@ captures are recorded only on success, as the manifest
 manifest carries no function identity, and `NvsnapFunction` does not
 project it. Its fallback records (`nvsnap-cachedir-<key>`) belong to a CRIU
 group, and `retirableCachedirCaptures` deletes them when the group is gone.
-Cachedir mode therefore needs a record of its own:
+Cachedir mode therefore needs a record of its own, per consuming function
+version and configuration:
 
-- created at the first capture attempt;
+- created at the first capture attempt, and also at a restore admission
+  or an observed failure when none exists. A function version can restore
+  a capture it never made (`electionPatches` restores an existing manifest
+  without a capture), the manifest can predate this change, and one
+  cachedir capture can serve several function versions of a tenant;
 - labelled with the function identity as `record_identity.go` labels group
   records;
 - projected by `internal/fnstatus` on its own;
@@ -266,6 +271,7 @@ The alerts rely on two changes in the agent:
 | `NvsnapRestoreFailing` | Restores that ran or could not run are more than 20% failures over 30 minutes, and at least 3 failed |
 | `NvsnapCaptureFailing` | 3 or more failed, unverified or gpushare-failed captures in an hour |
 | `NvsnapUnexpectedCold` | Any cold or fallback admission with a reason that counts against nvsnap, in 30 minutes |
+| `NvsnapAdmissionErrors` | Any `decision="error"` admission in 15 minutes. These reach the API server as successes, so no webhook metric sees them |
 | `NvsnapRankAdmittedWithout` | Any `missed` admission whose reason is not `opted-out`, in 15 minutes |
 | `NvsnapWebhookUnreachable` | The API server's calls to the nvsnap webhook fail (`apiserver_admission_webhook_request_total` with an error code, or its rejection count), in 15 minutes. `missed` cannot detect an outage: it is counted only for ranks of an instance whose leader the webhook did admit |
 | `NvsnapGPUFault` | Any faulty GPU probe result |
@@ -345,8 +351,8 @@ reasons are right.
 |---|---|
 | §2 | An error `Handler.Decide` admits unchanged, and a model-volume or election lookup error `Mutate` continues past, count `decision="error"`; a cache miss does not; each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
 | §3 | Each kind in the table appends one entry through its writer, including the webhook's background write, `failRestored` and the cachedir watcher; two concurrent appends both land; the list keeps the newest 10; takeover (`claimGroupRecord`), capture completion (`captureGroup`) and a bundle upgrade keep it, including entries written during the capture; the projection keeps the order and `lastFailure`; a record written before this change projects with no failures |
-| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), old failures followed by a long scrape gap and no new failure (must not fire), failures scraped before an agent restart and none after (still counted), one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
-| §3, cachedir | A cachedir-mode capture failure, and a failed seed whose workload still starts, are on the cachedir record, project onto `NvsnapFunction`, and survive a reaper pass |
+| §4 | `nvsnap_failures_total` has every kind at 0 after start; repeated fail-open admissions answered with HTTP 200, with no instance leader admitted, fire `NvsnapAdmissionErrors`; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), old failures followed by a long scrape gap and no new failure (must not fire), failures scraped before an agent restart and none after (still counted), one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
+| §3, cachedir | A cachedir-mode capture failure, a failed seed whose workload still starts, and a failed seed of a function version that restores a shared capture it never made, are on the cachedir record, project onto `NvsnapFunction`, and survive a reaper pass |
 | §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a run with the webhook made unreachable reports the API server's failed calls |
 
 ## Open questions
