@@ -128,9 +128,8 @@ The reasons split two ways:
 
 ### 3. The function keeps its failures
 
-Each record (`nvsnap-criu-group-<key>`, and `nvsnap-cachedir-<key>` for
-cachedir captures) gets a `failures` key: the last 10 failures of the
-configuration, newest first. Each entry holds:
+Each CRIU group record (`nvsnap-criu-group-<key>`) gets a `failures` key:
+the last 10 failures of the configuration, newest first. Each entry holds:
 
 - the time;
 - the kind (from the table above);
@@ -145,7 +144,8 @@ raise an event today:
 | Kind | Written by |
 |---|---|
 | Capture failed, unverified, gpushare-failed | the agent, in the update that already records the outcome on the record |
-| Cachedir capture failed, in either mode | the agent (`runCapture`, `captureFallbackRank`), on the cachedir record |
+| Cachedir capture failed, as a CRIU fallback | the agent (`captureFallbackRank`), on the configuration's group record |
+| Cachedir capture failed, in cachedir mode | no record holds it yet: see below |
 | Restore failed, not run, failed after restore (`failRestored`) | the agent that ran it |
 | Cold start nvsnap chose (§2) | the webhook, which runs in the agent, in the background so admission never waits on it; at most one entry per pod |
 
@@ -154,6 +154,25 @@ once. A merge patch of `failures` would let one append overwrite another,
 so each append goes through `updateGroupRecord`: a read, then an update
 conditioned on the record's `resourceVersion`, retried on conflict
 (`retry.RetryOnConflict`). The cachedir record gets the same helper.
+
+Cachedir mode, the chart's default, has no record to hold a failure. Its
+captures are recorded only on success, as the manifest
+`nvsnap-capture-<hash>` (`internal/checkpointstore/cmregistry.go`). That
+manifest carries no function identity, and `NvsnapFunction` does not
+project it. Its fallback records (`nvsnap-cachedir-<key>`) belong to a CRIU
+group, and `retirableCachedirCaptures` deletes them when the group is gone.
+Cachedir mode therefore needs a record of its own:
+
+- created at the first capture attempt;
+- labelled with the function identity as `record_identity.go` labels group
+  records;
+- projected by `internal/fnstatus` on its own;
+- kept by the reaper while its manifest or a failure younger than the
+  retention period exists.
+
+Until that is built, cachedir mode's failures reach only the metrics
+(§4) and the per-run half of §5. That record is the first item of the
+implementation.
 
 The history survives every rewrite of the record's data:
 
@@ -200,9 +219,18 @@ The alerts rely on two changes in the agent:
 
   `increase()` alone misses the first failure when Prometheus first sees
   a series already at 1, as it does when the failure comes before an
-  agent's first scrape. So each failure alert uses `increase()` together
-  with `(nvsnap_failures_total > 0) unless (nvsnap_failures_total offset <window>)`:
-  a series that is new within the window and already counts a failure.
+  agent's first scrape. So each failure alert adds the count of a process
+  that started within the window. A series merely missing from an earlier
+  sample does not prove that; a scrape gap looks the same:
+
+  ```
+  increase(nvsnap_failures_total[w])
+    or (nvsnap_failures_total > 0
+        and on (instance) (time() - process_start_time_seconds < w))
+  ```
+
+  `process_start_time_seconds` comes from the default registry, which the
+  agent's `/metrics` serves.
 - **`nvsnap_build_info` from every agent.** Built: it used to be set only
   under the CRIU capture method.
 
@@ -234,9 +262,13 @@ test" without anyone reading logs:
   nvsnap-server publishes a record's change within one reconcile (30 s by
   default), so the hook polls for up to two intervals before it reads.
   A failed test whose function has such an entry says so in its report.
-- **Per run.** At the end, the suite queries the cluster's metrics for
-  `increase(nvsnap_failures_total[<run>])` by kind. It prints the counts
-  next to the pass/fail summary.
+- **Per run.** At the end, the suite queries the cluster's metrics over the
+  run's window and prints, next to the pass/fail summary:
+  - nvsnap failures by kind, with §4's expression, so an agent that started
+    during the run and failed before its first scrape is counted;
+  - the API server's failed calls to the nvsnap webhook. An unreachable
+    webhook counts nothing in nvsnap, and an instance none of whose pods
+    reached it counts no `missed` admission either.
 
 This needs no new nvsnap endpoint. The change is in the suite: a teardown
 hook and a final step.
@@ -286,8 +318,9 @@ reasons are right.
 |---|---|
 | §2 | Each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
 | §3 | Each kind in the table appends one entry through its writer, including the webhook's background write, `failRestored` and the cachedir watcher; two concurrent appends both land; the list keeps the newest 10; takeover (`claimGroupRecord`), capture completion (`captureGroup`) and a bundle upgrade keep it, including entries written during the capture; the projection keeps the order and `lastFailure`; a record written before this change projects with no failures |
-| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, a failure before the agent's first scrape, an agent restart, one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
-| §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function |
+| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, a failure before the agent's first scrape, old failures followed by a long scrape gap and no new failure (must not fire), an agent restart, one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
+| §3, cachedir | A cachedir-mode capture failure is on the cachedir record, projects onto `NvsnapFunction`, and survives a reaper pass |
+| §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a run with the webhook made unreachable reports the API server's failed calls |
 
 ## Open questions
 
