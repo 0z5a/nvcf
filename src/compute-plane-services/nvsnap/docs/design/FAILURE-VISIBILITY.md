@@ -76,12 +76,14 @@ Metric names below are the exported ones (`nvsnap_` prefix).
 | A capture never served after restore | `{outcome="unverified"}`, no event | failed |
 | A configuration cannot be captured | `{outcome="refused"}`, event | refused, not failed: a known limit with a reason |
 | A pod never started under gpushare | `{outcome="gpushare-failed"}`, no event (`observeGPUShareFailed`) | failed |
-| A cachedir capture failed | `{method="cachedir",outcome="failed"}`, no event (`observeCachedirCapture`) | failed |
+| A cachedir capture failed, as a CRIU fallback | `{method="cachedir",outcome="failed"}`, no event (`observeCachedirCapture`) | failed |
+| A cachedir capture failed, in cachedir mode (the chart's default) | logged by `runCapture` (`internal/rootfsonly/watcher.go`), not counted | failed |
 | A restore ran and failed | `nvsnap_restore_outcomes_total{outcome="failed"}`, event | failed |
 | A restored pod failed after its restore | logged by `failRestored` (`internal/agent/restored_watch.go`), not counted | failed |
 | A restore could not run (fetch, placeholders) | `{outcome="not-run"}`, event | failed after its retries |
 | A restore failed on a faulty GPU | `{outcome="gpu-fault"}` | not nvsnap's, counted apart (`docs/design/GPU-FAULT-PROBE.md`) |
 | A pod that could restore started cold | `nvsnap_admissions_total{decision="cold"}` on the instance path; not counted on the single-pod path | failed when the reason is nvsnap's (§2) |
+| A capture whose restores stalled `criuGroupMaxStalls` times | not counted: `parseCRIUGroup` reports no capture, and its pods start cold uncounted | failed (§2) |
 | A pod admitted with the gpushare fallback | `nvsnap_admissions_total{decision="fallback",reason="gpushare-failed"}` | failed: follows a gpushare failure |
 | A rank of a captured instance admitted without nvsnap | `nvsnap_admissions_total{decision="missed"}`, with reason `opted-out` or not | failed unless opted out |
 | The webhook unreachable | nothing nvsnap counts; the API server's webhook metrics | failed (§4) |
@@ -111,6 +113,12 @@ path uses:
 | `criuRestoreFor` | The checkpoint failed to restore before | `checkpoint-blocked` |
 | `Mutate`, after `criuRestorePatches` fails | The pod cannot be prepared as the placeholder | `prepare-failed` |
 
+The instance path gains one: a complete capture whose restores stalled
+`criuGroupMaxStalls` times. `parseCRIUGroup` reports it as no capture at
+all today, so `criuGroupRestorePatches` returns before it counts. The
+lookup tells a stalled capture from an absent one and counts the cold
+start with reason `stalls-exhausted`.
+
 The reasons split two ways:
 
 - **Ones the pod's author chose** (`own-instance`) are expected.
@@ -120,8 +128,9 @@ The reasons split two ways:
 
 ### 3. The function keeps its failures
 
-The group record (`nvsnap-criu-group-<key>`) gets a `failures` key: the
-last 10 failures of the configuration, newest first. Each entry holds:
+Each record (`nvsnap-criu-group-<key>`, and `nvsnap-cachedir-<key>` for
+cachedir captures) gets a `failures` key: the last 10 failures of the
+configuration, newest first. Each entry holds:
 
 - the time;
 - the kind (from the table above);
@@ -135,14 +144,28 @@ raise an event today:
 
 | Kind | Written by |
 |---|---|
-| Capture failed, unverified, gpushare-failed, cachedir failed | the agent, in the patch that already records the outcome on the record |
+| Capture failed, unverified, gpushare-failed | the agent, in the update that already records the outcome on the record |
+| Cachedir capture failed, in either mode | the agent (`runCapture`, `captureFallbackRank`), on the cachedir record |
 | Restore failed, not run, failed after restore (`failRestored`) | the agent that ran it |
-| Cold start nvsnap chose (§2) | the webhook, which runs in the agent: a background merge patch, as `record_identity.go` writes identity labels, so admission never waits on it; at most one entry per pod |
+| Cold start nvsnap chose (§2) | the webhook, which runs in the agent, in the background so admission never waits on it; at most one entry per pod |
 
-Recapture keeps the history. `claimGroupRecord`
-(`internal/agent/criu_group.go`) replaces a record's data when a capture
-takes it over, keeping only `captures` and `previousReason`; it keeps
-`failures` too. A bundle upgrade keeps it the same way.
+Writers race: several agents and the webhook can append to one record at
+once. A merge patch of `failures` would let one append overwrite another,
+so each append goes through `updateGroupRecord`: a read, then an update
+conditioned on the record's `resourceVersion`, retried on conflict
+(`retry.RetryOnConflict`). The cachedir record gets the same helper.
+
+The history survives every rewrite of the record's data:
+
+- `claimGroupRecord` (`internal/agent/criu_group.go`), when a capture takes
+  a record over, keeps only `captures` and `previousReason` today;
+- `captureGroup`, when a capture completes, replaces the data inside
+  `updateGroupRecord` with the map it built from the record it read at the
+  start, which would drop entries written since.
+
+Both carry `failures` forward from the record as read inside the update,
+not from the earlier copy. A bundle
+upgrade keeps it the same way.
 
 `internal/fnstatus` projects the entries onto
 `NvsnapFunction`, under each configuration and as `lastFailure` at the top.
@@ -172,10 +195,14 @@ The alerts rely on two changes in the agent:
 
 - **A failure counter with fixed labels.** `nvsnap_failures_total{kind}`
   counts every failure in the table above by kind. The agent creates each
-  kind's series at 0 when it starts. `increase()` misses a counter's first
-  increment when the series first appears at 1, which would hide exactly
-  the rare failures the alerts are for. The outcome counters keep their
+  kind's series at 0 when it starts, and the outcome counters keep their
   open `reason` label for diagnosis.
+
+  `increase()` alone misses the first failure when Prometheus first sees
+  a series already at 1, as it does when the failure comes before an
+  agent's first scrape. So each failure alert uses `increase()` together
+  with `(nvsnap_failures_total > 0) unless (nvsnap_failures_total offset <window>)`:
+  a series that is new within the window and already counts a failure.
 - **`nvsnap_build_info` from every agent.** Built: it used to be set only
   under the CRIU capture method.
 
@@ -187,7 +214,7 @@ The alerts rely on two changes in the agent:
 | `NvsnapRankAdmittedWithout` | Any `missed` admission whose reason is not `opted-out`, in 15 minutes |
 | `NvsnapWebhookUnreachable` | The API server's calls to the nvsnap webhook fail (`apiserver_admission_webhook_request_total` with an error code, or its rejection count), in 15 minutes. `missed` cannot detect an outage: it is counted only for ranks of an instance whose leader the webhook did admit |
 | `NvsnapGPUFault` | Any faulty GPU probe result |
-| `NvsnapAgentsUnscraped` | `nvsnap_build_info` absent for 15 minutes: missing data fires |
+| `NvsnapAgentsUnscraped` | For 15 minutes, any of: the agents' targets report `up == 0`; fewer agents export `nvsnap_build_info` than the agent DaemonSet has ready pods (`kube_daemonset_status_number_ready`, where kube-state-metrics is scraped); no agent exports it at all. One silent node fires it, not only all of them |
 
 The thresholds are a starting point, to be checked against at least a week
 of scraped history before any alert pages. Severity and routing labels are
@@ -201,8 +228,8 @@ A regression suite run answers "did nvsnap fail anything, and in which
 test" without anyone reading logs:
 
 - **Per test.** A test knows its function version id and when it started.
-  At teardown it reads the `NvsnapFunction` labelled with that version
-  (`nvsnap.io/function-version-id`). It attaches each `failures` entry
+  At teardown it reads the `NvsnapFunction` named by that version id
+  (`fnstatus.ObjectName`). It attaches each `failures` entry
   timed after the test's start and naming a pod in the test's namespace.
   nvsnap-server publishes a record's change within one reconcile (30 s by
   default), so the hook polls for up to two intervals before it reads.
@@ -257,9 +284,9 @@ reasons are right.
 
 | Section | Test |
 |---|---|
-| §2 | Each of the four single-pod declines increments `nvsnap_admissions_total` with its reason (`internal/webhook/criu_restore_test.go`) |
-| §3 | Each kind in the table appends one entry through its writer, including the webhook's background write and `failRestored`; the list keeps the newest 10; recapture (`claimGroupRecord`) and a bundle upgrade keep it; the projection keeps the order and `lastFailure`; a record written before this change projects with no failures |
-| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, a first failure after a fresh start, an agent restart, and missing data; the chart renders the rule only where the cluster serves the API |
+| §2 | Each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
+| §3 | Each kind in the table appends one entry through its writer, including the webhook's background write, `failRestored` and the cachedir watcher; two concurrent appends both land; the list keeps the newest 10; takeover (`claimGroupRecord`), capture completion (`captureGroup`) and a bundle upgrade keep it, including entries written during the capture; the projection keeps the order and `lastFailure`; a record written before this change projects with no failures |
+| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, a failure before the agent's first scrape, an agent restart, one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
 | §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function |
 
 ## Open questions
