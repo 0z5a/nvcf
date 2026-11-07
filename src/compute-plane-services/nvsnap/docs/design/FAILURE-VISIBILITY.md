@@ -123,6 +123,11 @@ it counts as `decision="error"` with the error's class. That covers:
 - errors `Mutate` logs and continues past (`internal/webhook/mutate.go`:
   the model-volume and election lookups), counted where they are caught.
 
+- errors the CRIU lookups turn into "no capture": `lookupCRIUGroupFor`
+  (a namespace read) and `lookupCRIUGroup` (a record read) return false on
+  any error today. The lookup result tells an error from an absent capture
+  and from an exhausted one (below), and the error is counted.
+
 A cache miss (the backend answers "not found") is not an error and is not
 counted.
 
@@ -141,84 +146,80 @@ The reasons split two ways:
 
 ### 3. The function keeps its failures
 
-Each CRIU group record (`nvsnap-criu-group-<key>`) gets a `failures` key:
-the last 10 failures of the configuration, newest first. Each entry holds:
+Each function version gets one failure record, whatever its capture
+method and whether it ever captured: the ConfigMap
+`nvsnap-failures-<name>` in nvsnap's namespace, where `<name>` is the
+version's `NvsnapFunction` name (`fnstatus.ObjectName`: the version id, or
+`ns-<namespace>` outside NVCF). It is labelled with the function's
+identity, as `record_identity.go` labels group records.
+
+The history does not live on the capture records:
+
+- **Not every function version has one.** A standalone CRIU capture has
+  only a manifest. A cachedir capture has only its manifest
+  (`nvsnap-capture-<hash>`), written on success, with no function
+  identity. A function version can restore a capture it never made.
+- **Capture records are rewritten.** A capture's takeover
+  (`claimGroupRecord`) and its completion (`captureGroup`) replace a group
+  record's data.
+- **Capture records are deleted with their capture**
+  (`retirableCachedirCaptures`).
+
+A record of its own avoids all three.
+
+The record holds the last 10 failures, newest first. Each entry holds:
 
 - the time;
 - the kind (from the table above);
 - the reason class (the metric's `reason` label);
-- the pod (namespace/name) and node;
+- the configuration (the capture key), when there is one;
+- the pod (namespace/name and UID) and node;
 - the first 256 bytes of the message. The full message stays in the event
   and the agent's log, which can hold up to 16 KiB (`groupReasonMax`).
 
-Every kind in the table above has its own write, not only those that
-raise an event today:
+An entry is appended by whoever observes the failure:
 
 | Kind | Written by |
 |---|---|
-| Capture failed, unverified, gpushare-failed | the agent, in the update that already records the outcome on the record |
-| Cachedir capture failed, as a CRIU fallback | the agent (`captureFallbackRank`), on the configuration's group record |
-| Cachedir capture failed, in cachedir mode | no record holds it yet: see below |
+| Capture failed, unverified, gpushare-failed; cachedir capture failed, in either mode | the agent that ran the capture (`captureGroup`, `observeGPUShareFailed`, `captureFallbackRank`, `runCapture`) |
 | Restore failed, not run, failed after restore (`failRestored`) | the agent that ran it |
-| Cachedir restore whose seeding failed | the seed step writes a result file the agent reads, through an observer that runs in cachedir mode too |
-| Admission error turned into "admit unchanged" | counted only (§4): the pod may name no record yet |
-| Cold start nvsnap chose (§2) | the webhook, which runs in the agent, in the background so admission never waits on it; at most one entry per pod |
+| Cachedir restore whose seeding failed | the agent on the pod's node, from a result file the seed step writes, through an observer that runs in cachedir mode too |
+| Cold start nvsnap chose, admission error (§2) | the agent on the pod's node, from the pod's `nvsnap.io/admission` annotation |
 
-Writers race: several agents and the webhook can append to one record at
-once. A merge patch of `failures` would let one append overwrite another,
-so each append goes through `updateGroupRecord`: a read, then an update
-conditioned on the record's `resourceVersion`, retried on conflict
-(`retry.RetryOnConflict`). The cachedir record gets the same helper.
+**Admission decisions are written onto the pod.** The webhook does not
+write the record from admission:
 
-Cachedir mode, the chart's default, has no record to hold a failure. Its
-captures are recorded only on success, as the manifest
-`nvsnap-capture-<hash>` (`internal/checkpointstore/cmregistry.go`). That
-manifest carries no function identity, and `NvsnapFunction` does not
-project it. Its fallback records (`nvsnap-cachedir-<key>`) belong to a CRIU
-group, and `retirableCachedirCaptures` deletes them when the group is gone.
-Cachedir mode therefore needs a record of its own, per consuming function
-version and configuration:
+- A background write would be lost if the agent stopped before it
+  committed.
+- A synchronous write would make admission wait on the API server.
 
-- created at the first capture attempt, and also at a restore admission
-  or an observed failure when none exists. A function version can restore
-  a capture it never made (`electionPatches` restores an existing manifest
-  without a capture), the manifest can predate this change, and one
-  cachedir capture can serve several function versions of a tenant;
-- labelled with the function identity as `record_identity.go` labels group
-  records;
-- projected by `internal/fnstatus` on its own;
-- kept by the reaper while its manifest or a failure younger than the
-  retention period exists.
+Instead, the webhook's own patch annotates the pod with its decision:
+`nvsnap.io/admission: cold/checkpoint-blocked`, or `error/<class>`.
+Where it would otherwise admit the pod unchanged after an error, it
+returns a patch carrying only that annotation. The pod carries the
+decision for as long as it exists. The agent on its node appends it once
+per pod UID, so a restarted agent replays what it had not written.
 
-Until that is built, cachedir mode's failures reach only the metrics
-(§4) and the per-run half of §5. That record is the first item of the
-implementation.
+**Writers race.** Several agents can append to one record at once, so each
+append is a read, then an update conditioned on the record's
+`resourceVersion`, retried on conflict (`retry.RetryOnConflict`). An append
+that fails for any other reason is retried with backoff (1 s to 30 s, for up
+to 5 minutes), then logged. The failure is still counted (§4).
 
-The history survives every rewrite of the record's data:
+**Projection.** `internal/fnstatus` projects the record onto the version's
+`NvsnapFunction`:
 
-- `claimGroupRecord` (`internal/agent/criu_group.go`), when a capture takes
-  a record over, keeps only `captures` and `previousReason` today;
-- `captureGroup`, when a capture completes, replaces the data inside
-  `updateGroupRecord` with the map it built from the record it read at the
-  start, which would drop entries written since.
+- as `failures`, each entry under its configuration when it names one;
+- as `lastFailure` at the top.
 
-Both carry `failures` forward from the record as read inside the update,
-not from the earlier copy. A bundle
-upgrade keeps it the same way.
-
-`internal/fnstatus` projects the entries onto
-`NvsnapFunction`, under each configuration and as `lastFailure` at the top.
 `kubectl get nvsnapfunctions` shows a `LAST-FAILURE` column, the age of
-`lastFailure`.
+`lastFailure`. A version with failures and no capture gets an
+`NvsnapFunction` too, with no configuration.
 
-The record is the right place for three reasons:
-
-- it is already per function version;
-- it is already labelled with the function's identity;
-- it outlives the pods, the events and the agent.
-
-Ten entries of at most about 400 bytes each add under 4 KiB to the
-record.
+**Retention.** The reaper deletes a failure record once its newest entry is
+older than the retention period and no capture record of the version
+remains. Ten entries of at most about 400 bytes each keep the record under
+4 KiB.
 
 ### 4. Alerts ship with the chart
 
@@ -333,26 +334,29 @@ reasons are right.
 
 ## Limits
 
-- **Failures before a record exists** (a capture refused before the
-  agent created one) reach the metrics and events, not `NvsnapFunction`.
-- **Deleted records take their history with them.** When a record is deleted
-  (retention or a configuration change), its failures go too. The metrics
-  keep the counts. How long records outlive their function is not yet
-  checked.
+- **A pod with no function identity** (outside NVCF, in a namespace the
+  agent cannot name) has no failure record; its failures reach the metrics
+  and events only.
+- **History ends with retention.** A failure record is deleted once its
+  newest entry is older than the retention period and the version has no
+  capture left. The metrics keep the counts.
+- **A pod deleted before its node's agent sees it** takes its admission
+  annotation with it. Its admission is still counted (§4).
 - **The alerts need scraped metrics and a rule evaluator.** On a cluster
   without the ServiceMonitor API, only §3 and the per-test half of §5 work.
 - **An agent restart loses the counts since its last scrape.** At a
   30-second scrape interval, a failure in the last 30 seconds before a
-  restart can go uncounted. The record keeps it.
+  restart can go uncounted. The failure record keeps it.
 
 ## Tests
 
 | Section | Test |
 |---|---|
 | §2 | An error `Handler.Decide` admits unchanged, and a model-volume or election lookup error `Mutate` continues past, count `decision="error"`; a cache miss does not; each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
-| §3 | Each kind in the table appends one entry through its writer, including the webhook's background write, `failRestored` and the cachedir watcher; two concurrent appends both land; the list keeps the newest 10; takeover (`claimGroupRecord`), capture completion (`captureGroup`) and a bundle upgrade keep it, including entries written during the capture; the projection keeps the order and `lastFailure`; a record written before this change projects with no failures |
+| §3 | Each kind in the table appends one entry through its writer, including `failRestored`, the cachedir watcher and the seed result; two concurrent appends both land; a non-conflict API error is retried; the list keeps the newest 10; the projection keeps the order and `lastFailure`; a version with failures and no capture is projected
 | §4 | `nvsnap_failures_total` has every kind at 0 after start; repeated fail-open admissions answered with HTTP 200, with no instance leader admitted, fire `NvsnapAdmissionErrors`; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), old failures followed by a long scrape gap and no new failure (must not fire), failures scraped before an agent restart and none after (still counted), one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
-| §3, cachedir | A cachedir-mode capture failure, a failed seed whose workload still starts, and a failed seed of a function version that restores a shared capture it never made, are on the cachedir record, project onto `NvsnapFunction`, and survive a reaper pass |
+| §3, every capture kind | A failure is on the version's failure record and projects onto `NvsnapFunction`, for: a CRIU group capture, a standalone CRIU capture, a cachedir-mode capture, a failed seed whose workload still starts, and a version that restores a shared capture it never made. The record survives a recapture and a reaper pass |
+| §3, admission | A cold start's `nvsnap.io/admission` annotation is appended once per pod UID; an agent restarted between the admission and the append replays it; a fail-open error admits the pod with only the annotation |
 | §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a run with the webhook made unreachable reports the API server's failed calls |
 
 ## Open questions
