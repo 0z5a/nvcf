@@ -84,6 +84,8 @@ Metric names below are the exported ones (`nvsnap_` prefix).
 | A restore failed on a faulty GPU | `{outcome="gpu-fault"}` | not nvsnap's, counted apart (`docs/design/GPU-FAULT-PROBE.md`) |
 | A pod that could restore started cold | `nvsnap_admissions_total{decision="cold"}` on the instance path; not counted on the single-pod path | failed when the reason is nvsnap's (§2) |
 | A capture whose restores stalled `criuGroupMaxStalls` times | not counted: `parseCRIUGroup` reports no capture, and its pods start cold uncounted | failed (§2) |
+| An admission error the webhook turned into "admit unchanged" | logged by `Handler.Decide` (`internal/webhook/admission.go`, "fail-open"), not counted; the API server sees a success | failed |
+| A cachedir restore whose cache seeding failed | not observed: the seed step runs in the pod, and in cachedir mode the agent's restore observer (`startCRIUAutoRestore`) does not run. Unverified: whether the seed step still exits 0 after a failed copy | failed |
 | A pod admitted with the gpushare fallback | `nvsnap_admissions_total{decision="fallback",reason="gpushare-failed"}` | failed: follows a gpushare failure |
 | A rank of a captured instance admitted without nvsnap | `nvsnap_admissions_total{decision="missed"}`, with reason `opted-out` or not | failed unless opted out |
 | The webhook unreachable | nothing nvsnap counts; the API server's webhook metrics | failed (§4) |
@@ -112,6 +114,10 @@ path uses:
 | `criuRestoreFor` | The capture belongs to another tenant scope | `scope-mismatch` |
 | `criuRestoreFor` | The checkpoint failed to restore before | `checkpoint-blocked` |
 | `Mutate`, after `criuRestorePatches` fails | The pod cannot be prepared as the placeholder | `prepare-failed` |
+
+Every error `Handler.Decide` turns into an unchanged admission counts as
+`decision="error"` with the error's class, apart from a cache miss, which
+is not an error.
 
 The instance path gains one: a complete capture whose restores stalled
 `criuGroupMaxStalls` times. `parseCRIUGroup` reports it as no capture at
@@ -147,6 +153,8 @@ raise an event today:
 | Cachedir capture failed, as a CRIU fallback | the agent (`captureFallbackRank`), on the configuration's group record |
 | Cachedir capture failed, in cachedir mode | no record holds it yet: see below |
 | Restore failed, not run, failed after restore (`failRestored`) | the agent that ran it |
+| Cachedir restore whose seeding failed | the seed step writes a result file the agent reads, through an observer that runs in cachedir mode too |
+| Admission error turned into "admit unchanged" | counted only (§4): the pod may name no record yet |
 | Cold start nvsnap chose (§2) | the webhook, which runs in the agent, in the background so admission never waits on it; at most one entry per pod |
 
 Writers race: several agents and the webhook can append to one record at
@@ -224,10 +232,17 @@ The alerts rely on two changes in the agent:
   sample does not prove that; a scrape gap looks the same:
 
   ```
-  increase(nvsnap_failures_total[w])
-    or (nvsnap_failures_total > 0
-        and on (instance) (time() - process_start_time_seconds < w))
+    (increase(nvsnap_failures_total[w])
+       and on (instance) (time() - process_start_time_seconds >= w))
+  or
+    (nvsnap_failures_total
+       and on (instance) (time() - process_start_time_seconds < w))
   ```
+
+  An agent older than the window is counted by `increase()`; one that
+  started within it, by its whole count. The two halves never match the
+  same series, so `or` cannot keep a zero from one side over the other's
+  count.
 
   `process_start_time_seconds` comes from the default registry, which the
   agent's `/metrics` serves.
@@ -316,10 +331,10 @@ reasons are right.
 
 | Section | Test |
 |---|---|
-| §2 | Each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
+| §2 | An error `Handler.Decide` admits unchanged counts `decision="error"`, and a cache miss does not; each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
 | §3 | Each kind in the table appends one entry through its writer, including the webhook's background write, `failRestored` and the cachedir watcher; two concurrent appends both land; the list keeps the newest 10; takeover (`claimGroupRecord`), capture completion (`captureGroup`) and a bundle upgrade keep it, including entries written during the capture; the projection keeps the order and `lastFailure`; a record written before this change projects with no failures |
-| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, a failure before the agent's first scrape, old failures followed by a long scrape gap and no new failure (must not fire), an agent restart, one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
-| §3, cachedir | A cachedir-mode capture failure is on the cachedir record, projects onto `NvsnapFunction`, and survives a reaper pass |
+| §4 | `nvsnap_failures_total` has every kind at 0 after start; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), old failures followed by a long scrape gap and no new failure (must not fire), an agent restart, one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
+| §3, cachedir | A cachedir-mode capture failure, and a failed seed whose workload still starts, are on the cachedir record, project onto `NvsnapFunction`, and survive a reaper pass |
 | §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a run with the webhook made unreachable reports the API server's failed calls |
 
 ## Open questions
