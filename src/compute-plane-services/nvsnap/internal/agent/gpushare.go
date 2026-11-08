@@ -44,7 +44,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 const (
@@ -439,6 +439,14 @@ func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, clockAt int64, 
 	return append(append(args, "resume"), intsToStrings(pids)...)
 }
 
+// gpushareHoldGateSupported reports whether the GPU tool (its binary's
+// text, gpuToolText) has resume --hold-gate and open; tools from before the
+// gate reject the option. "" (the text could not be read) is false.
+func gpushareHoldGateSupported(toolText string) bool {
+	return strings.Contains(toolText, "--hold-gate") &&
+		strings.Contains(toolText, "let the pids' GPU launches through")
+}
+
 // gpushareOpen lets the GPU launches of pids, resumed with holdGate,
 // through. A group's pods resume on their own nodes, each rebinding its
 // share of the memory multicast across nodes; one that launched first
@@ -453,6 +461,24 @@ func gpushareOpen(ctx context.Context, hostPID int, pids []int, log *logrus.Entr
 	}
 	log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()}).
 		Info("gpushare: opened " + lastLines(out, 1))
+	return nil
+}
+
+// openHeldGPUOnUnlock ends a group rank's wait for the instance's verdict
+// (verdict and err, from awaitUnlock): only "unlock" lets its held GPU
+// launches through, by open. On an error or an abort they stay held: another
+// rank may not have rebound its memory, so a launch could spin as
+// gpushareOpen says, and the failed instance's pods are deleted (failGroup).
+func openHeldGPUOnUnlock(session, verdict string, err error, open func() error) error {
+	if err != nil {
+		return err
+	}
+	if verdict != fabricVerdictUnlock {
+		return fmt.Errorf("criu-v2: group restore %s aborted: another pod of the instance failed to restore; this pod stays locked, its GPU launches held, until it is deleted", session)
+	}
+	if err := open(); err != nil {
+		return fmt.Errorf("gpushare open: %w", err)
+	}
 	return nil
 }
 

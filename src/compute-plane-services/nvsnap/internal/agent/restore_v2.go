@@ -51,9 +51,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // errNotPlaceholder marks a restore refused because the target already runs
@@ -213,6 +213,13 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// handle exchange of the resume).
 	var sess *restoreSession
 	if group.Session != "" {
+		// Its GPU launches must wait until every rank has resumed: a rank
+		// that launched first could write to a GPU not bound yet. A tool
+		// that cannot hold them (a bundle from before the gate) is refused
+		// here, before CRIU runs, rather than resumed ungated.
+		if gs != nil && !gpushareHoldGateSupported(tools.gpuToolText()) {
+			return nil, fmt.Errorf("gpushare: the GPU tool of node bundle %s cannot hold the GPU launches of a group restore until every rank has resumed (it has no --hold-gate and open); refusing the restore", tools.version)
+		}
 		if group.InetAddrMap != "" && !criuSupportsNetMigration(a.agentCRIUHelp()) {
 			return nil, errors.New("criu-v2: the agent's CRIU has no --inet-addr-map/net-unlock")
 		}
@@ -345,8 +352,8 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		fabricDir = sess.containerDir
 	}
 	// resumeGPU reloads the restored processes' GPU memory (gpushare);
-	// holdGate keeps their GPU launches waiting until openGPU. toolPID is
-	// the pid the resume tool entered, once it ran, for openGPU.
+	// holdGate keeps their GPU launches waiting until gpushareOpen. toolPID
+	// is the pid the resume tool entered, once it ran, for gpushareOpen.
 	toolPID := 0
 	var clockAt int64
 	// clockWait is how long the GPU resume waited for the dumped clock:
@@ -441,28 +448,13 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		// Its GPU launches are held until every pod of the instance has
 		// resumed (gpushareOpen). The unlock below is that point: a pod
 		// reports restored only after its resume, and the unlock comes once
-		// every pod has. Once held, the gate is opened on every path, or
-		// the workload never launches again.
-		held := false
-		openGPU := func() error {
-			if !held || toolPID == 0 {
-				return nil
-			}
-			held = false
-			return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
-		}
+		// every pod has. On any other outcome they stay held
+		// (openHeldGPUOnUnlock).
 		if gs != nil {
-			held = true
 			if err := resumeGPU(true); err != nil {
-				if oerr := openGPU(); oerr != nil {
-					log.WithError(oerr).Warn("gpushare: could not open the GPU launches of a failed resume")
-				}
 				return nil, err
 			}
 			if err := continueTasks(); err != nil {
-				if oerr := openGPU(); oerr != nil {
-					log.WithError(oerr).Warn("gpushare: could not open the GPU launches of a failed resume")
-				}
 				return nil, err
 			}
 		}
@@ -470,17 +462,13 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		// sends: hold the lock until the driver says so, then release it in
 		// this pod's network namespace.
 		verdict, err := sess.awaitUnlock(ctx, log)
-		if oerr := openGPU(); oerr != nil {
-			if err == nil && verdict == "unlock" {
-				return nil, fmt.Errorf("gpushare open: %w", oerr)
+		if err := openHeldGPUOnUnlock(group.Session, verdict, err, func() error {
+			if gs == nil {
+				return nil
 			}
-			log.WithError(oerr).Warn("gpushare: could not open the GPU launches of an aborted group restore")
-		}
-		if err != nil {
+			return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
+		}); err != nil {
 			return nil, err
-		}
-		if verdict != "unlock" {
-			return nil, fmt.Errorf("criu-v2: group restore %s aborted: another pod of the instance failed to restore; this pod stays locked until it is deleted", group.Session)
 		}
 		if group.InetAddrMap != "" {
 			if err := netUnlock(ctx, hostPID, checkpointDir, log); err != nil {

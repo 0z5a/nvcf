@@ -20,6 +20,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,7 +28,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
@@ -308,5 +309,61 @@ func TestGPUShareTargets_ShimWithoutGPU(t *testing.T) {
 	fakeGPUProc(t, base, 5000, 51, 5000, []string{testShim}, nil)
 	if pids, _, ok, err := gpushareTargets(base, 5000); err != nil || ok || pids != nil {
 		t.Fatalf("pids=%v ok=%v err=%v", pids, ok, err)
+	}
+}
+
+// A group restore needs the tool's GPU gate; a tool from before it, or one
+// whose text cannot be read, has none.
+func TestGpushareHoldGateSupported(t *testing.T) {
+	tool := "--hold-gate: (resume after CRIU restore) ...\n" +
+		"         open         (after resume --hold-gate: let the pids' GPU launches through)\n"
+	if !gpushareHoldGateSupported(tool) {
+		t.Error("a tool with the gate and open")
+	}
+	for name, text := range map[string]string{
+		"before the gate": "--timeout-ms MS --gpu-map FILE --fabric-map DIR suspend resume",
+		"gate, no open":   "--hold-gate: (resume after CRIU restore) ...",
+		"unreadable":      "",
+	} {
+		if gpushareHoldGateSupported(text) {
+			t.Errorf("%s: reported as supported", name)
+		}
+	}
+}
+
+// A group rank's held GPU launches go through only on "unlock": on an abort
+// or an error another rank may not have rebound its memory.
+func TestOpenHeldGPUOnUnlock(t *testing.T) {
+	waitErr := errors.New("context canceled")
+	openErr := errors.New("open failed")
+	for _, tc := range []struct {
+		name     string
+		verdict  string
+		err      error
+		openErr  error
+		wantOpen bool
+		wantErr  string
+	}{
+		{name: "unlock", verdict: fabricVerdictUnlock, wantOpen: true},
+		{name: "abort", verdict: fabricVerdictAbort, wantErr: "group restore s1 aborted"},
+		{name: "wait error", err: waitErr, wantErr: "context canceled"},
+		{name: "unlock, open fails", verdict: fabricVerdictUnlock, openErr: openErr, wantOpen: true, wantErr: "gpushare open: open failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opened := false
+			err := openHeldGPUOnUnlock("s1", tc.verdict, tc.err, func() error {
+				opened = true
+				return tc.openErr
+			})
+			if opened != tc.wantOpen {
+				t.Errorf("opened = %v, want %v", opened, tc.wantOpen)
+			}
+			if tc.wantErr == "" && err != nil {
+				t.Errorf("err = %v, want nil", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }
