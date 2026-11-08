@@ -53,21 +53,19 @@ three cases:
 The instance path counts the same decisions as `admissions_total{decision="cold"}`
 with a reason (`internal/webhook/criu_group.go`).
 
-On a regression run against a test cluster, the suite reported four
-failures that do not occur with nvsnap off. The user saw only:
+On a regression run against a test cluster, the suite reported failures
+that do not occur with nvsnap off. For two of them, the user saw only:
 
 | Test failure | What nvsnap had done |
 |---|---|
 | A 504 | Captured the function's only pod while it served |
 | An instance terminated for "no capacity" | Pinned a cold start to a node with no free GPU |
 
-Attributing those four took hours of reading agent logs. The one record
+Attributing them meant reading agent logs by hand, and the one record
 that named the cause had already expired.
 
 ## What a failure is
 
-| Kind | Source today | Counted as |
-|---|---|---|
 Metric names below are the exported ones (`nvsnap_` prefix).
 
 | Kind | Source today | Counted as |
@@ -187,6 +185,7 @@ An entry is appended by whoever observes the failure:
 | Restore failed, not run, failed after restore (`failRestored`) | the agent that ran it |
 | Cachedir restore whose seeding failed | the agent on the pod's node, from a result file the seed step writes, through an observer that runs in cachedir mode too |
 | Cold start nvsnap chose, admission error (§2) | the agent on the pod's node, from the pod's `nvsnap.io/admission` annotation |
+| The same, for a pod no node has taken | nvsnap-server, from the same annotation, once the pod has been unschedulable for 60 seconds or is deleted without a node |
 
 **Admission decisions are written onto the pod.** The webhook does not
 write the record from admission:
@@ -201,6 +200,19 @@ Where it would otherwise admit the pod unchanged after an error, it
 returns a patch carrying only that annotation. The pod carries the
 decision for as long as it exists. The agent on its node appends it once
 per pod UID, so a restarted agent replays what it had not written.
+
+**Pods no node takes.** Admission comes before scheduling, so a pod that
+stays pending (no node has a free GPU, say) has no agent to record its
+decision, and that is one of the failures the record is for. nvsnap-server
+runs once per cluster and already watches pods. It appends the decision of
+an annotated pod with no `spec.nodeName` once the pod's `PodScheduled`
+condition has been `False` for 60 seconds, or when the pod is deleted
+before any node took it. The entry names the pod UID and the scheduler's
+reason (`Unschedulable` and its message). Entries are keyed by pod UID: a
+pod scheduled after the server wrote its entry is not appended again by
+its node's agent, and the server skips a UID already on the record. The
+server's ClusterRole reads ConfigMaps today; it gets `create` and `update`
+on them, in nvsnap's namespace only (a Role).
 
 **Writers race.** Several agents can append to one record at once, so each
 append is a read, then an update conditioned on the record's
@@ -253,7 +265,7 @@ The alerts rely on two changes in the agent:
   `failed`), created at 0 at start like the failure counter. Each process is
   then its own series, and each series is judged by its own age:
 
-  ```
+  ```promql
     (increase(nvsnap_failures_total[w])
        and on (instance, boot)
        (time() - last_over_time(nvsnap_agent_start_time_seconds[w]) >= w))
@@ -365,10 +377,10 @@ reasons are right.
 | Section | Test |
 |---|---|
 | §2 | An error `Handler.Decide` admits unchanged, and a model-volume or election lookup error `Mutate` continues past, count `decision="error"`; a cache miss does not; each of the four single-pod declines, and the instance path's `stalls-exhausted`, increments `nvsnap_admissions_total` with its reason; a stalled capture is told from an absent one |
-| §3 | Each kind in the table appends one entry through its writer, including `failRestored`, the cachedir watcher and the seed result; two concurrent appends both land; a non-conflict API error is retried; the list keeps the newest 10; the projection keeps the order and `lastFailure`; a version with failures and no capture is projected
+| §3 | Each kind in the table appends one entry through its writer, including `failRestored`, the cachedir watcher and the seed result; two concurrent appends both land; a non-conflict API error is retried; the list keeps the newest 10; the projection keeps the order and `lastFailure`; a version with failures and no capture is projected |
 | §4 | `nvsnap_failures_total` has every kind at 0 after start; repeated fail-open admissions answered with HTTP 200, with no instance leader admitted, fire `NvsnapAdmissionErrors`; `promtool test rules` for every alert, firing and not firing, three failures before the agent's first scrape followed by several unchanged scrapes (counts 3), 20 successful and 3 failed restores before the first scrape (13%: `NvsnapRestoreFailing` does not fire), old failures followed by a long scrape gap and no new failure (must not fire), failures scraped before an agent restart and none after (still counted), one of two agents going silent, and missing data; the chart renders the rule only where the cluster serves the API |
 | §3, every capture kind | A failure is on the version's failure record and projects onto `NvsnapFunction`, for: a CRIU group capture, a standalone CRIU capture (once, also when a group capture invoked it), a shared cache set that was not collected or refreshed, a cachedir-mode capture, a failed seed whose workload still starts, and a version that restores a shared capture it never made. The record survives a recapture and a reaper pass |
-| §3, admission | A cold start's `nvsnap.io/admission` annotation is appended once per pod UID; an agent restarted between the admission and the append replays it; a fail-open error admits the pod with only the annotation |
+| §3, admission | A cold start's `nvsnap.io/admission` annotation is appended once per pod UID; an agent restarted between the admission and the append replays it; a fail-open error admits the pod with only the annotation; a pod unschedulable for 60 seconds, and one deleted with no node, is appended by nvsnap-server with the scheduler's reason; a pod scheduled after the server's append is not appended again by its agent |
 | §5 | Against a test cluster: a run with a deliberately blocked checkpoint reports the `checkpoint-blocked` cold start under its test, and not under a later test of the same function; a failure-record write delayed past 60 seconds is still attributed; a run with the webhook made unreachable reports the API server's failed calls |
 
 ## Open questions
