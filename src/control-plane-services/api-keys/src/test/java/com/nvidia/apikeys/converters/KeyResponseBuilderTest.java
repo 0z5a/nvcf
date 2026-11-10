@@ -90,6 +90,6 @@ class KeyResponseBuilderTest {
     @Test
     void toIntrospectionResponse() {
         assertThat(keyResponseBuilder.toIntrospectionResponse(KEY_VO_1))
-                .isEqualTo(INTROSPECTION_RESPONSE_1.toBuilder().ncaId("test-nca-id").build());
+                .isEqualTo(INTROSPECTION_RESPONSE_1);
     }
 }
