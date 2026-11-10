@@ -19,6 +19,8 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use stargate_protocol::tunnel_contract::{
     HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED, RETRY_REASON_QUEUE_ESTIMATE_MISMATCH,
+    RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED, RETRY_REASON_UPSTREAM_OVERLOADED,
+    RETRY_REASON_UPSTREAM_SERVER_ERROR, RETRY_REASON_UPSTREAM_UNAVAILABLE,
 };
 
 mod replay;
@@ -26,6 +28,9 @@ mod replay;
 pub(super) use replay::{ReplayReadiness, ReplayableRequestBody};
 
 const RETRY_REASON_RETRYABLE_PROXY_ERROR: &str = "retryable_proxy_error";
+// A request that crashes the engine fails with a 500 on every instance it
+// reaches, so it gets one other instance, not every one.
+const MAX_UPSTREAM_SERVER_ERROR_RETRIES: u32 = 1;
 const DEFAULT_RETRY_BUDGET_MS_HEADER: &str = "x-stargate-max-wait-ms";
 const DEFAULT_MAX_REPLAY_BODY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -105,6 +110,7 @@ pub(super) fn decide_upstream_response_retry(
     retry: &ProxyRetryConfig,
     retry_budget_remaining: bool,
     request_retries: u32,
+    server_error_retries: u32,
     replay_readiness: ReplayReadiness,
 ) -> RetryDecision<UpstreamRetry> {
     if !should_retry_upstream_response(status, headers, retry) {
@@ -115,7 +121,10 @@ pub(super) fn decide_upstream_response_retry(
     if !retry_budget_remaining {
         return retry_exhausted("retry_budget_exhausted");
     }
-    if request_retries >= retry.max_request_retries {
+    if request_retries >= retry.max_request_retries
+        || (retry_reason == RETRY_REASON_UPSTREAM_SERVER_ERROR
+            && server_error_retries >= MAX_UPSTREAM_SERVER_ERROR_RETRIES)
+    {
         return retry_exhausted(retry_reason);
     }
 
@@ -175,14 +184,27 @@ fn should_retry_upstream_response(
     headers: &HeaderMap,
     retry: &ProxyRetryConfig,
 ) -> bool {
-    retry.retryable_status_codes.contains(&status)
-        && match header_str(headers, HEADER_STARGATE_RETRYABLE) {
-            Some(retryable) => retryable.eq_ignore_ascii_case("true"),
-            None => {
-                !headers.contains_key(HEADER_STARGATE_RETRYABLE)
-                    && !retry.require_pylon_retry_signal
-            }
+    match header_str(headers, HEADER_STARGATE_RETRYABLE) {
+        // Pylon decides which model server errors are safe to retry.
+        Some(retryable) => !status.is_success() && retryable.eq_ignore_ascii_case("true"),
+        None => {
+            !headers.contains_key(HEADER_STARGATE_RETRYABLE)
+                && !retry.require_pylon_retry_signal
+                && retry.retryable_status_codes.contains(&status)
         }
+    }
+}
+
+/// Whether Pylon marked a model server error, rather than its own rejection.
+/// The client gets the model server's answer when no other instance is left.
+pub(super) fn is_upstream_error_retry_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        RETRY_REASON_UPSTREAM_OVERLOADED
+            | RETRY_REASON_UPSTREAM_UNAVAILABLE
+            | RETRY_REASON_UPSTREAM_SERVER_ERROR
+            | RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED
+    )
 }
 
 pub(super) fn is_internal_capacity_rejection(status: StatusCode, headers: &HeaderMap) -> bool {
@@ -396,15 +418,55 @@ mod tests {
     }
 
     #[test]
-    fn retry_signal_is_ignored_for_non_retryable_status() {
+    fn pylon_retry_signal_decides_for_error_statuses() {
         let retry = ProxyRetryConfig::default();
         let headers = retry_headers("true", None);
 
+        for status in [529, 500, 404] {
+            assert!(
+                should_retry_upstream_response(
+                    StatusCode::from_u16(status).unwrap(),
+                    &headers,
+                    &retry
+                ),
+                "{status}"
+            );
+        }
         assert!(!should_retry_upstream_response(
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
             &headers,
             &retry
         ));
+    }
+
+    #[test]
+    fn upstream_server_error_is_retried_once_per_request() {
+        let retry = ProxyRetryConfig::default();
+        let headers = retry_headers("true", Some(RETRY_REASON_UPSTREAM_SERVER_ERROR));
+        let decide = |server_error_retries| {
+            decide_upstream_response_retry(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &headers,
+                &retry,
+                true,
+                1,
+                server_error_retries,
+                ReplayReadiness::Ready,
+            )
+        };
+
+        assert_eq!(
+            decide(0),
+            RetryDecision::Retry(UpstreamRetry::AlternateCluster(
+                RETRY_REASON_UPSTREAM_SERVER_ERROR.to_owned()
+            ))
+        );
+        assert_eq!(
+            decide(1),
+            RetryDecision::Final(FinalRetryDisposition::Exhausted(
+                RETRY_REASON_UPSTREAM_SERVER_ERROR.to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -461,6 +523,7 @@ mod tests {
                 &retry,
                 true,
                 0,
+                0,
                 ReplayReadiness::Ready,
             ),
             RetryDecision::Retry(UpstreamRetry::AlternateCluster(
@@ -480,6 +543,7 @@ mod tests {
                 &headers,
                 &retry,
                 true,
+                0,
                 0,
                 ReplayReadiness::Ready,
             ),
@@ -501,6 +565,7 @@ mod tests {
                 &retry,
                 false,
                 0,
+                0,
                 ReplayReadiness::Ready,
             ),
             RetryDecision::Final(FinalRetryDisposition::Exhausted(
@@ -514,6 +579,7 @@ mod tests {
                 &retry,
                 true,
                 retry.max_request_retries,
+                0,
                 ReplayReadiness::PayloadTooLarge,
             ),
             RetryDecision::Final(FinalRetryDisposition::Exhausted(

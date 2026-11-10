@@ -31,6 +31,8 @@ use stargate_protocol::tunnel_contract::{
     HEADER_STARGATE_RETRY_AFTER_MS, HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     HEADER_STARGATE_UPSTREAM_RETRYABLE, RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED,
     RETRY_REASON_QUEUE_ESTIMATE_MISMATCH, RETRY_REASON_UPSTREAM_ADMISSION_REJECTED,
+    RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED, RETRY_REASON_UPSTREAM_OVERLOADED,
+    RETRY_REASON_UPSTREAM_SERVER_ERROR, RETRY_REASON_UPSTREAM_UNAVAILABLE,
     is_internal_control_header,
 };
 use stargate_telemetry::{
@@ -1276,10 +1278,14 @@ pub(super) fn build_response_headers(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     let status_retryable = retry.retryable_upstream_status_codes.contains(&status);
-    let retryable =
+    let admission_rejected =
         status_retryable && (!retry.require_upstream_retry_header || upstream_retry_header_present);
-    let reason = if retryable {
+    let backend_error_reason = backend_error_retry_reason(status, response_headers);
+    let retryable = admission_rejected || backend_error_reason.is_some();
+    let reason = if admission_rejected {
         RETRY_REASON_UPSTREAM_ADMISSION_REJECTED
+    } else if let Some(reason) = backend_error_reason {
+        reason
     } else if status_retryable {
         "missing_upstream_retry_header"
     } else if !status.is_success() {
@@ -1300,11 +1306,7 @@ pub(super) fn build_response_headers(
     }
 
     if retryable {
-        insert_retry_metadata(
-            &mut header_frame,
-            true,
-            RETRY_REASON_UPSTREAM_ADMISSION_REJECTED,
-        );
+        insert_retry_metadata(&mut header_frame, true, reason);
         if retry.propagate_retry_after
             && let Some(retry_after_ms) = retry_after_millis(response_headers)
         {
@@ -1322,6 +1324,28 @@ pub(super) fn build_response_headers(
         }
     }
     Ok(header_frame)
+}
+
+/// The response head is classified before any output is relayed, so these
+/// model server refusals are safe to retry on another instance.
+fn backend_error_retry_reason(
+    status: StatusCode,
+    response_headers: &HeaderMap,
+) -> Option<&'static str> {
+    match status.as_u16() {
+        529 => Some(RETRY_REASON_UPSTREAM_OVERLOADED),
+        503 => Some(RETRY_REASON_UPSTREAM_UNAVAILABLE),
+        500 => Some(RETRY_REASON_UPSTREAM_SERVER_ERROR),
+        // Dynamo answers an empty 404 once the model has left its registry; a
+        // 404 with a body is the model server's own answer to the request.
+        404 if response_headers
+            .get(CONTENT_LENGTH)
+            .is_some_and(|value| value.as_bytes() == b"0") =>
+        {
+            Some(RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED)
+        }
+        _ => None,
+    }
 }
 
 fn retry_after_millis(response_headers: &HeaderMap) -> Option<u64> {
@@ -1613,6 +1637,58 @@ mod tests {
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded["x-end-to-end"], "preserved");
         server.shutdown().await;
+    }
+
+    #[test]
+    fn backend_errors_before_output_are_marked_retryable() {
+        // (label, status, content-length, backend retry header, expected retry reason)
+        #[rustfmt::skip] // one case per line
+        let cases = [
+            ("overloaded", 529, Some("120"), false, Some("upstream_overloaded")),
+            ("not_ready", 503, Some("80"), false, Some("upstream_unavailable")),
+            ("signalled_503", 503, Some("80"), true, Some("upstream_admission_rejected")),
+            ("server_error", 500, Some("90"), false, Some("upstream_server_error")),
+            ("model_unregistered", 404, Some("0"), false, Some("upstream_model_unregistered")),
+            ("model_not_found", 404, Some("63"), false, None),
+            ("chunked_404", 404, None, false, None),
+            ("bad_gateway", 502, Some("20"), false, None),
+            ("gateway_timeout", 504, Some("20"), false, None),
+            ("unsignalled_429", 429, Some("20"), false, None),
+            ("signalled_429", 429, Some("20"), true, Some("upstream_admission_rejected")),
+            ("bad_request", 400, Some("20"), false, None),
+            ("ok", 200, Some("20"), false, None),
+        ];
+        for (label, status, content_length, has_retry_header, expected_reason) in cases {
+            let mut upstream = HeaderMap::new();
+            if let Some(content_length) = content_length {
+                upstream.insert(CONTENT_LENGTH, HeaderValue::from_static(content_length));
+            }
+            if has_retry_header {
+                upstream.insert(
+                    HEADER_STARGATE_UPSTREAM_RETRYABLE,
+                    HeaderValue::from_static("true"),
+                );
+            }
+            let forwarded = build_response_headers(
+                StatusCode::from_u16(status).unwrap(),
+                &upstream,
+                &PylonRetryConfig::default(),
+                None,
+                "inst-a",
+            )
+            .unwrap();
+            let header = |name| forwarded.get(name).map(|value| value.to_str().unwrap());
+            assert_eq!(
+                header(HEADER_STARGATE_RETRY_REASON),
+                expected_reason,
+                "{label}"
+            );
+            assert_eq!(
+                header(HEADER_STARGATE_RETRYABLE),
+                expected_reason.map(|_| "true"),
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]

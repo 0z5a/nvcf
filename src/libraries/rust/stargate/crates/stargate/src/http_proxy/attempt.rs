@@ -22,7 +22,7 @@ use axum::response::Response;
 use stargate_protocol::tunnel_contract::{
     HEADER_INFERENCE_SERVER_ID as HEADER_CHOSEN_INFERENCE_SERVER_ID, HEADER_STARGATE_ERROR_CODE,
     HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE, RETRY_REASON_LOCAL_CONNECT_FAILURE,
-    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE,
+    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE, RETRY_REASON_UPSTREAM_SERVER_ERROR,
 };
 use tracing::{Instrument, Span, field, info, warn};
 
@@ -32,9 +32,10 @@ use super::ProxyAppState;
 use super::retry::{
     FinalRetryDisposition, RetryDecision, UpstreamRetry, decide_proxy_error_retry,
     decide_upstream_response_retry, header_str, is_internal_capacity_rejection,
-    retry_budget_has_remaining, should_release_queue_mismatch_reservation,
+    is_upstream_error_retry_reason, retry_budget_has_remaining,
+    should_release_queue_mismatch_reservation,
 };
-use super::routing::overloaded_response;
+use super::routing::{RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND, overloaded_response};
 use super::run::{ProxyRequestRun, SelectedClusterRun};
 use super::upstream::{
     UpstreamStreamingResponse, copy_forwardable_headers, headers_for_upstream_attempt,
@@ -59,6 +60,7 @@ pub(super) struct ProxyAttemptCounters {
     pub(super) attempt: u32,
     connect_retries: u32,
     request_retries: u32,
+    server_error_retries: u32,
 }
 
 pub(super) enum ProxyAttemptOutcome {
@@ -241,6 +243,7 @@ impl ProxyRequestRun<'_> {
             &self.app.retry,
             retry_budget_has_remaining(self.request.retry_deadline),
             self.attempt_counters.request_retries,
+            self.attempt_counters.server_error_retries,
             self.request.replay_body.replay_readiness(),
         ) {
             RetryDecision::Final(disposition) => {
@@ -248,6 +251,14 @@ impl ProxyRequestRun<'_> {
             }
             RetryDecision::Retry(retry) => retry,
         };
+        if let UpstreamRetry::AlternateCluster(reason) = &retry
+            && is_upstream_error_retry_reason(reason)
+            && !self.has_untried_cluster(&chosen.cluster_id).await
+        {
+            let disposition =
+                FinalRetryDisposition::Exhausted(RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND.to_owned());
+            return finish_attempt(self, chosen, disposition, Ok(upstream));
+        }
         let (outcome, retry_reason, message) = match retry {
             UpstreamRetry::AlternateBackend(reason) => (
                 ProxyAttemptOutcome::RetryAlternateBackend(chosen.inference_server_id.clone()),
@@ -261,6 +272,9 @@ impl ProxyRequestRun<'_> {
             ),
         };
         self.attempt_counters.request_retries += 1;
+        if retry_reason == RETRY_REASON_UPSTREAM_SERVER_ERROR {
+            self.attempt_counters.server_error_retries += 1;
+        }
         self.record_retry(&retry_reason);
         warn!(
             inference_server_id = %chosen.inference_server_id,

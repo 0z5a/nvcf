@@ -398,6 +398,42 @@ async fn start_capturing_chat_backend(retryable_rejection: bool) -> CapturingCha
     CapturingChatBackend { addr, hits, bodies }
 }
 
+/// A model server that answers every chat request with one error head and
+/// body, the way a Dynamo frontend refuses work before any output.
+async fn start_status_backend(status: StatusCode, body: &'static str) -> CapturingChatBackend {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_app = hits.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request| {
+                let hits = hits_for_app.clone();
+                async move {
+                    let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut response = Response::builder().status(status);
+                    if !body.is_empty() {
+                        response = response.header("content-type", "application/json");
+                    }
+                    response
+                        .body(Body::from(body))
+                        .expect("error response should build")
+                }
+            }),
+        )
+        .route("/health", get(|| async { "ok" }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    CapturingChatBackend {
+        addr,
+        hits,
+        bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+    }
+}
+
 fn make_stargate_runtime_with_retry(
     id: &str,
     retry: ProxyRetryConfig,
@@ -597,6 +633,42 @@ impl ProxyFixture {
             "registration failed",
         );
         self.own_tunnel(tunnel);
+    }
+
+    /// Registers one Pylon instance as its own cluster, as production Pylons
+    /// do, in front of a model server that always answers `status`.
+    async fn add_status_backend(
+        &mut self,
+        instance_id: &str,
+        model: &str,
+        queued_input_size: u64,
+        status: StatusCode,
+        body: &'static str,
+    ) -> CapturingChatBackend {
+        let runtime = active_runtime(model);
+        set_model_queue(&runtime, model, queued_input_size);
+        let backend = start_status_backend(status, body).await;
+        let mut tunnel_config = QuicHttpTunnelConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            format!("http://{}", backend.addr),
+        );
+        tunnel_config.forwarding.runtime_state = runtime.clone();
+        let tunnel = start_quic_http_tunnel(tunnel_config)
+            .await
+            .expect("status backend tunnel failed to start");
+        self.register(
+            active_registration_config_with_state(
+                self.grpc_addr,
+                instance_id,
+                instance_id,
+                format!("quic://{}", tunnel.listen_addr()),
+                format!("http://{}", backend.addr),
+                runtime,
+            ),
+            "status backend registration failed",
+        );
+        self.own_tunnel(tunnel);
+        backend
     }
 
     async fn add_capturing_direct_backend(
@@ -3170,6 +3242,121 @@ async fn retryable_single_backend_exhausts_eligible_backends() {
     );
 
     fixture.shutdown().await;
+}
+
+// Error bodies as a Dynamo frontend returns them.
+const DYNAMO_OVERLOADED_BODY: &str = r#"{"error":{"message":"Service temporarily overloaded","type":"overloaded_error","param":null,"code":"overloaded_error"}}"#;
+const DYNAMO_SERVER_ERROR_BODY: &str = r#"{"error":{"message":"Failed to generate completions","type":"server_error","param":null,"code":null}}"#;
+const DYNAMO_NOT_READY_BODY: &str =
+    r#"{"error":{"message":"Model `backend-error-model` is not ready to serve requests yet."}}"#;
+const DYNAMO_NOT_FOUND_BODY: &str =
+    r#"{"message":"Model not found","type":"Not Found","code":404}"#;
+const GENERIC_ERROR_BODY: &str = r#"{"error":"upstream failure"}"#;
+
+#[tokio::test]
+async fn backend_error_before_output_is_retried_on_an_untried_instance() {
+    // (label, status of the failing instance, its body, whether the healthy instance serves the request)
+    let cases: &[(&str, u16, &str, bool)] = &[
+        ("overloaded_529", 529, DYNAMO_OVERLOADED_BODY, true),
+        ("not_ready_503", 503, DYNAMO_NOT_READY_BODY, true),
+        ("worker_dead_500", 500, DYNAMO_SERVER_ERROR_BODY, true),
+        // Dynamo's answer once the model has left its registry.
+        ("model_unregistered_404", 404, "", true),
+        ("model_not_found_404", 404, DYNAMO_NOT_FOUND_BODY, false),
+        ("bad_gateway_502", 502, GENERIC_ERROR_BODY, false),
+        ("gateway_timeout_504", 504, GENERIC_ERROR_BODY, false),
+        ("unsignalled_429", 429, GENERIC_ERROR_BODY, false),
+    ];
+    let model = "backend-error-model";
+    for &(label, status, body, is_retried) in cases {
+        let status = StatusCode::from_u16(status).unwrap();
+        let mut fixture = ProxyFixture::start(&format!("test-sg-backend-error-{label}")).await;
+        // The failing instance looks idle, so it keeps attracting first attempts.
+        let failing = fixture
+            .add_status_backend("inst-a", model, 0, status, body)
+            .await;
+        let healthy_runtime = active_runtime(model);
+        set_model_queue(&healthy_runtime, model, 1);
+        fixture
+            .add_dummy_backend("inst-b", "inst-b", model, healthy_runtime)
+            .await;
+        fixture.wait_for_clusters(model, 2).await;
+
+        let mut failures = Vec::new();
+        for seq in 0..10 {
+            let response = fixture
+                .chat_request(model, &format!("req-{label}-{seq}"))
+                .send()
+                .await
+                .expect("request failed");
+            if response.status() != StatusCode::OK {
+                failures.push(response.status());
+            }
+            let _ = response.bytes().await;
+        }
+        assert!(
+            failing.hits() > 0,
+            "{label}: failing instance got no traffic"
+        );
+        if is_retried {
+            assert!(failures.is_empty(), "{label}: client saw {failures:?}");
+        } else {
+            assert_eq!(failures.len(), failing.hits(), "{label}: {failures:?}");
+            assert!(
+                failures.iter().all(|failure| *failure == status),
+                "{label}: {failures:?}"
+            );
+        }
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn backend_errors_on_every_instance_return_the_last_backend_response() {
+    // (label, instances, status every instance answers, its body, instances tried)
+    let cases: &[(&str, usize, u16, &str, usize)] = &[
+        ("single_instance_529", 1, 529, DYNAMO_OVERLOADED_BODY, 1),
+        ("single_instance_503", 1, 503, DYNAMO_NOT_READY_BODY, 1),
+        ("two_instances_529", 2, 529, DYNAMO_OVERLOADED_BODY, 2),
+        // The request retry limit is 2.
+        ("four_instances_529", 4, 529, DYNAMO_OVERLOADED_BODY, 3),
+        // A 500 is retried once, so a request that crashes the engine reaches two instances.
+        ("three_instances_500", 3, 500, DYNAMO_SERVER_ERROR_BODY, 2),
+    ];
+    let model = "backend-error-model";
+    for &(label, instances, status, body, expected_tried) in cases {
+        let status = StatusCode::from_u16(status).unwrap();
+        let mut fixture = ProxyFixture::start(&format!("test-sg-backend-errors-{label}")).await;
+        let mut backends = Vec::new();
+        for index in 0..instances {
+            backends.push(
+                fixture
+                    .add_status_backend(&format!("inst-{index}"), model, 0, status, body)
+                    .await,
+            );
+        }
+        fixture.wait_for_clusters(model, instances).await;
+
+        let response = fixture
+            .chat_request(model, &format!("req-{label}"))
+            .send()
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), status, "{label}");
+        assert!(
+            response.headers().get("x-stargate-error-code").is_none(),
+            "{label}: the backend response should be relayed unchanged"
+        );
+        assert_eq!(response.text().await.unwrap(), body, "{label}");
+        let hits: Vec<usize> = backends.iter().map(CapturingChatBackend::hits).collect();
+        assert_eq!(
+            hits.iter().sum::<usize>(),
+            expected_tried,
+            "{label}: {hits:?}"
+        );
+        assert!(hits.iter().all(|hits| *hits <= 1), "{label}: {hits:?}");
+        fixture.shutdown().await;
+    }
 }
 
 #[tokio::test]
