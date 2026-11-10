@@ -3311,43 +3311,70 @@ async fn backend_error_before_output_is_retried_on_an_untried_instance() {
     }
 }
 
+fn dynamo_error_body(status: u16) -> &'static str {
+    match status {
+        529 => DYNAMO_OVERLOADED_BODY,
+        503 => DYNAMO_NOT_READY_BODY,
+        500 => DYNAMO_SERVER_ERROR_BODY,
+        _ => GENERIC_ERROR_BODY,
+    }
+}
+
 #[tokio::test]
-async fn backend_errors_on_every_instance_return_the_last_backend_response() {
-    // (label, instances, status every instance answers, its body, instances tried)
-    let cases: &[(&str, usize, u16, &str, usize)] = &[
-        ("single_instance_529", 1, 529, DYNAMO_OVERLOADED_BODY, 1),
-        ("single_instance_503", 1, 503, DYNAMO_NOT_READY_BODY, 1),
-        ("two_instances_529", 2, 529, DYNAMO_OVERLOADED_BODY, 2),
+async fn backend_errors_on_every_instance_stop_at_the_retry_limits() {
+    // (label, status of each instance, instances tried, whether the client gets the router's overload response)
+    let cases: &[(&str, &[u16], usize, bool)] = &[
+        ("single_instance_529", &[529], 1, true),
+        ("two_instances_529", &[529, 529], 2, true),
         // The request retry limit is 2.
-        ("four_instances_529", 4, 529, DYNAMO_OVERLOADED_BODY, 3),
+        ("four_instances_529", &[529, 529, 529, 529], 3, true),
+        ("single_instance_503", &[503], 1, false),
         // A 500 is retried once, so a request that crashes the engine reaches two instances.
-        ("three_instances_500", 3, 500, DYNAMO_SERVER_ERROR_BODY, 2),
+        ("three_instances_500", &[500, 500, 500], 2, false),
+        // Not every instance was overloaded, so the last backend response is relayed.
+        ("mixed_500_and_529", &[500, 529], 2, false),
     ];
     let model = "backend-error-model";
-    for &(label, instances, status, body, expected_tried) in cases {
-        let status = StatusCode::from_u16(status).unwrap();
+    for &(label, statuses, expected_tried, is_overload_response) in cases {
         let mut fixture = ProxyFixture::start(&format!("test-sg-backend-errors-{label}")).await;
         let mut backends = Vec::new();
-        for index in 0..instances {
+        for (index, status) in statuses.iter().enumerate() {
             backends.push(
                 fixture
-                    .add_status_backend(&format!("inst-{index}"), model, 0, status, body)
+                    .add_status_backend(
+                        &format!("inst-{index}"),
+                        model,
+                        0,
+                        StatusCode::from_u16(*status).unwrap(),
+                        dynamo_error_body(*status),
+                    )
                     .await,
             );
         }
-        fixture.wait_for_clusters(model, instances).await;
+        fixture.wait_for_clusters(model, statuses.len()).await;
 
         let response = fixture
             .chat_request(model, &format!("req-{label}"))
             .send()
             .await
             .expect("request failed");
-        assert_eq!(response.status(), status, "{label}");
-        assert!(
-            response.headers().get("x-stargate-error-code").is_none(),
-            "{label}: the backend response should be relayed unchanged"
-        );
-        assert_eq!(response.text().await.unwrap(), body, "{label}");
+        let status = response.status();
+        let error_code = response
+            .headers()
+            .get("x-stargate-error-code")
+            .map(|value| value.to_str().unwrap().to_owned());
+        let body = response.text().await.unwrap();
+        if is_overload_response {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(error_code.as_deref(), Some("overloaded_error"), "{label}");
+        } else {
+            assert!(statuses.contains(&status.as_u16()), "{label}: {status}");
+            assert_eq!(
+                error_code, None,
+                "{label}: backend response should be relayed unchanged"
+            );
+            assert_eq!(body, dynamo_error_body(status.as_u16()), "{label}");
+        }
         let hits: Vec<usize> = backends.iter().map(CapturingChatBackend::hits).collect();
         assert_eq!(
             hits.iter().sum::<usize>(),

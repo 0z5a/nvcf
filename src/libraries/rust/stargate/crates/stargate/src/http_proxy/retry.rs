@@ -197,7 +197,7 @@ fn should_retry_upstream_response(
 
 /// Whether Pylon marked a model server error, rather than its own rejection.
 /// The client gets the model server's answer when no other instance is left.
-pub(super) fn is_upstream_error_retry_reason(reason: &str) -> bool {
+pub(super) fn is_model_server_error_reason(reason: &str) -> bool {
     matches!(
         reason,
         RETRY_REASON_UPSTREAM_OVERLOADED

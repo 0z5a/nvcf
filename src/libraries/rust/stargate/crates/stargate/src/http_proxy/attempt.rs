@@ -22,7 +22,8 @@ use axum::response::Response;
 use stargate_protocol::tunnel_contract::{
     HEADER_INFERENCE_SERVER_ID as HEADER_CHOSEN_INFERENCE_SERVER_ID, HEADER_STARGATE_ERROR_CODE,
     HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE, RETRY_REASON_LOCAL_CONNECT_FAILURE,
-    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE, RETRY_REASON_UPSTREAM_SERVER_ERROR,
+    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE, RETRY_REASON_UPSTREAM_OVERLOADED,
+    RETRY_REASON_UPSTREAM_SERVER_ERROR,
 };
 use tracing::{Instrument, Span, field, info, warn};
 
@@ -32,10 +33,10 @@ use super::ProxyAppState;
 use super::retry::{
     FinalRetryDisposition, RetryDecision, UpstreamRetry, decide_proxy_error_retry,
     decide_upstream_response_retry, header_str, is_internal_capacity_rejection,
-    is_upstream_error_retry_reason, retry_budget_has_remaining,
+    is_model_server_error_reason, retry_budget_has_remaining,
     should_release_queue_mismatch_reservation,
 };
-use super::routing::{RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND, overloaded_response};
+use super::routing::overloaded_response;
 use super::run::{ProxyRequestRun, SelectedClusterRun};
 use super::upstream::{
     UpstreamStreamingResponse, copy_forwardable_headers, headers_for_upstream_attempt,
@@ -61,6 +62,7 @@ pub(super) struct ProxyAttemptCounters {
     connect_retries: u32,
     request_retries: u32,
     server_error_retries: u32,
+    has_non_overload_retry: bool,
 }
 
 pub(super) enum ProxyAttemptOutcome {
@@ -252,11 +254,10 @@ impl ProxyRequestRun<'_> {
             RetryDecision::Retry(retry) => retry,
         };
         if let UpstreamRetry::AlternateCluster(reason) = &retry
-            && is_upstream_error_retry_reason(reason)
+            && is_model_server_error_reason(reason)
             && !self.has_untried_cluster(&chosen.cluster_id).await
         {
-            let disposition =
-                FinalRetryDisposition::Exhausted(RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND.to_owned());
+            let disposition = FinalRetryDisposition::Exhausted(reason.clone());
             return finish_attempt(self, chosen, disposition, Ok(upstream));
         }
         let (outcome, retry_reason, message) = match retry {
@@ -274,6 +275,9 @@ impl ProxyRequestRun<'_> {
         self.attempt_counters.request_retries += 1;
         if retry_reason == RETRY_REASON_UPSTREAM_SERVER_ERROR {
             self.attempt_counters.server_error_retries += 1;
+        }
+        if retry_reason != RETRY_REASON_UPSTREAM_OVERLOADED {
+            self.attempt_counters.has_non_overload_retry = true;
         }
         self.record_retry(&retry_reason);
         warn!(
@@ -412,6 +416,14 @@ fn finish_attempt(
     if let Some(retry_reason) = disposition.retry_reason() {
         Span::current().record("proxy.retry_reason", retry_reason);
     }
+    // When every instance this request tried was overloaded, the client gets
+    // the router's overload answer, as for an overloaded single backend.
+    let every_attempt_overloaded = matches!(disposition, FinalRetryDisposition::Exhausted(_))
+        && !run.attempt_counters.has_non_overload_retry
+        && upstream.as_ref().is_ok_and(|response| {
+            header_str(&response.headers, HEADER_STARGATE_RETRY_REASON)
+                == Some(RETRY_REASON_UPSTREAM_OVERLOADED)
+        });
     let upstream = match disposition {
         FinalRetryDisposition::PassThrough | FinalRetryDisposition::ReplayIncomplete(_) => upstream,
         FinalRetryDisposition::AmbiguousDelivery => {
@@ -426,9 +438,10 @@ fn finish_attempt(
         }
         FinalRetryDisposition::PayloadTooLarge(_) => Err(StatusCode::PAYLOAD_TOO_LARGE),
     };
-    let capacity_rejected = upstream
-        .as_ref()
-        .is_ok_and(|response| is_internal_capacity_rejection(response.status, &response.headers));
+    let capacity_rejected = every_attempt_overloaded
+        || upstream.as_ref().is_ok_and(|response| {
+            is_internal_capacity_rejection(response.status, &response.headers)
+        });
     let status = if capacity_rejected {
         StatusCode::SERVICE_UNAVAILABLE
     } else {

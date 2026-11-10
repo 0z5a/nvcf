@@ -31,7 +31,6 @@ use crate::routing_state::{RoutedClusterSnapshot, RoutingTargetKey};
 use super::HEADER_STARGATE_ERROR_CODE;
 
 const ERROR_OVERLOADED: &str = "overloaded_error";
-pub(super) const RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND: &str = "no_eligible_backend";
 const ERROR_NO_ELIGIBLE_CANDIDATES: &str = "no_eligible_candidates";
 const ERROR_NO_ELIGIBLE_CANDIDATES_BODY: &str =
     r#"{"error":"no eligible candidates","code":"no_eligible_candidates"}"#;
@@ -170,9 +169,9 @@ pub(super) fn finalize_no_routing_choice(
     if context.failed_backend_count > 0 || context.failed_cluster_count > 0 {
         context
             .metrics
-            .proxy_retry_exhausted_total(rk_ref, model_id, RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND)
+            .proxy_retry_exhausted_total(rk_ref, model_id, "no_eligible_backend")
             .inc();
-        Span::current().record("proxy.retry_reason", RETRY_EXHAUSTED_NO_ELIGIBLE_BACKEND);
+        Span::current().record("proxy.retry_reason", "no_eligible_backend");
     }
     warn!(
         routing_key = ?context.target.routing_key,

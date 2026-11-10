@@ -255,13 +255,15 @@ The local upstream may mark `429` or `503` retryable for pylon with
 metadata and does not forward the upstream header downstream.
 
 Pylon also marks these model server errors retryable without that header,
-because it classifies the response head before any output reaches Stargate:
+because it classifies the response head before any output reaches Stargate.
+`--pylon-retryable-upstream-status-codes` and
+`--pylon-require-upstream-retry-header` do not change this list.
 
 | Upstream response | `x-stargate-retry-reason` | Retries per request |
 | --- | --- | --- |
-| `529` | `upstream_overloaded` | Up to 2 |
-| `503` | `upstream_unavailable` | Up to 2 |
-| `404` with `content-length: 0` | `upstream_model_unregistered` | Up to 2 |
+| `529` | `upstream_overloaded` | `--proxy-max-request-retries` (default 2) |
+| `503` | `upstream_unavailable` | `--proxy-max-request-retries` (default 2) |
+| `404` with `content-length: 0` | `upstream_model_unregistered` | `--proxy-max-request-retries` (default 2) |
 | `500` | `upstream_server_error` | 1 |
 
 A Dynamo frontend answers the empty `404` once the model has left its
@@ -269,7 +271,9 @@ registry. A `404` with a body, `502`, and `504` pass through. Stargate retries
 each of these only on an instance this request has not tried. A `500` gets one
 retry, so a request that crashes the engine reaches at most two instances.
 When no untried instance is left, or the retries run out, the client gets the
-last model server response unchanged.
+last model server response unchanged. If every instance that the request tried
+answered `529`, the client gets `503` with `x-stargate-error-code:
+overloaded_error` instead.
 
 Queued requests can wait a long time before their first output. Stargate waits
 up to `--quic-request-timeout-ms` (default 300000) for response headers from
