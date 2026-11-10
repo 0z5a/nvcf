@@ -30,6 +30,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -425,7 +426,7 @@ func TestStreamedRequestReachesUpstreamBeforeClientEOF(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		upstreamBody <- append(got, rest...)
+		upstreamBody <- slices.Concat(got, rest)
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
 	})
 	_, handler := newPrefixTestDirector(t, 25<<20, transport)
@@ -537,21 +538,14 @@ func TestStreamedRequestOverRealTransport(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		result <- sha256.Sum256(append(got, rest...))
+		result <- sha256.Sum256(slices.Concat(got, rest))
 		w.WriteHeader(http.StatusOK)
 	}))
 
 	pr, pw := io.Pipe()
 	req, err := http.NewRequest(http.MethodPost, url+"/v1/chat/completions", pr)
 	require.NoError(t, err)
-	responses := make(chan *http.Response, 1)
-	go func() {
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			responses <- resp
-		}
-		close(responses)
-	}()
+	response := sendAsync(req)
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := io.WriteString(pw, head)
@@ -568,10 +562,9 @@ func TestStreamedRequestOverRealTransport(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, pw.Close())
 
-	resp, ok := <-responses
-	require.True(t, ok)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
+	got := <-response
+	require.NoError(t, got.err)
+	require.Equal(t, http.StatusOK, got.status)
 	assert.Equal(t, sha256.Sum256([]byte(head+tail)), <-result)
 }
 
@@ -931,6 +924,29 @@ type iotestErrReader struct{ err error }
 
 func (r iotestErrReader) Read([]byte) (int, error) { return 0, r.err }
 
+type clientResult struct {
+	status int
+	body   string
+	err    error
+}
+
+// sendAsync sends req from another goroutine and delivers its status and
+// body after the response has been read and closed.
+func sendAsync(req *http.Request) <-chan clientResult {
+	result := make(chan clientResult, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			result <- clientResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		payload, err := io.ReadAll(resp.Body)
+		result <- clientResult{status: resp.StatusCode, body: string(payload), err: err}
+	}()
+	return result
+}
+
 // TestReadModelRequestBodySmallBodiesStaySmall bounds the bytes allocated for
 // a small request: the prefix buffer must not grow to the 64 KiB limit, and
 // pooled buffers must be reused.
@@ -998,22 +1014,11 @@ func TestStreamedRequestEarlyUpstreamResponse(t *testing.T) {
 	}()
 	defer pw.Close()
 
-	done := make(chan *http.Response, 1)
-	go func() {
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			close(done)
-			return
-		}
-		done <- resp
-	}()
 	select {
-	case resp, ok := <-done:
-		require.True(t, ok, "client request failed")
-		defer resp.Body.Close()
-		payload, _ := io.ReadAll(resp.Body)
-		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-		assert.Contains(t, string(payload), "bdd-early-reject")
+	case got := <-sendAsync(req):
+		require.NoError(t, got.err, "client request failed")
+		assert.Equal(t, http.StatusUnauthorized, got.status)
+		assert.Contains(t, got.body, "bdd-early-reject")
 	case <-time.After(10 * time.Second):
 		t.Fatal("the client did not receive the early upstream response")
 	}
