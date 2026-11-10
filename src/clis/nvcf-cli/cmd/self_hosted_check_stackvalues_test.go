@@ -322,6 +322,127 @@ func TestCheck_RegistriesNeedTheEnvironmentFile(t *testing.T) {
 	}
 }
 
+// A plane whose stack has no readable file for the install's environment says
+// so in a warning row naming the file, since the run then checks without that
+// stack's values. No row where the stack is left out by design: no named
+// environment, a stack that cannot be read here, or --local-only, which reads
+// no stack. Nor for a file that is read, or for a stack whose values the run
+// does not use: the compute plane's when the registry check belongs to the
+// control plane, and the control plane's when the registry check belongs to
+// the compute plane and no cluster-validator runs.
+func TestCheck_UnreadEnvironmentFileIsAWarningRow(t *testing.T) {
+	t.Setenv("HELMFILE_ENV", "")
+	t.Setenv("NVCF_CLI_DEFAULT_CONTROL_PLANE_STACK", "")
+	t.Setenv("NVCF_CLI_DEFAULT_COMPUTE_PLANE_STACK", "")
+	t.Setenv("NVCF_CLI_SELFHOSTED_SKIP_INOTIFY", "1")
+	missing, valid := stackWithEnvs(t), stackWithEnvs(t, "prod")
+	malformed := stackWithEnvs(t)
+	require.NoError(t, os.WriteFile(filepath.Join(malformed, "environments", "prod.yaml"),
+		[]byte("global: [unclosed\n"), 0o644))
+	notAFile := stackWithEnvs(t)
+	require.NoError(t, os.Mkdir(filepath.Join(notAFile, "environments", "prod.yaml"), 0o755))
+	envFile := func(stack, env string) string { return filepath.Join(stack, "environments", env+".yaml") }
+	const leftOut = "; the stack's registries are not used"
+
+	for name, tc := range map[string]struct {
+		args []string
+		// category and message of the row, or "" for none.
+		category, message string
+	}{
+		"missing": {
+			args:     []string{"--control-plane", "--env", "prod", "--control-plane-stack", missing},
+			category: "control-plane-cluster", message: envFile(missing, "prod") + " is missing" + leftOut,
+		},
+		"malformed": {
+			args:     []string{"--control-plane", "--env", "prod", "--control-plane-stack", malformed},
+			category: "control-plane-cluster",
+			message:  envFile(malformed, "prod") + " cannot be read or is not valid YAML" + leftOut,
+		},
+		"not a regular file": {
+			args:     []string{"--control-plane", "--env", "prod", "--control-plane-stack", notAFile},
+			category: "control-plane-cluster", message: envFile(notAFile, "prod") + " is not a regular file" + leftOut,
+		},
+		"named with HELMFILE_ENV": {
+			args:     []string{"--control-plane", "--control-plane-stack", missing},
+			category: "control-plane-cluster", message: envFile(missing, "staging") + " is missing" + leftOut,
+		},
+		"--pre reads up's default environment": {
+			args:     []string{"--pre", "--control-plane-stack", missing},
+			category: "control-plane-cluster", message: envFile(missing, "local") + " is missing" + leftOut,
+		},
+		"with the cluster-validator": {
+			args: []string{"--control-plane", "--env", "prod", "--control-plane-stack", missing,
+				"--cluster-validator-image", pinnedValidatorImage},
+			category: "control-plane-cluster",
+			message: envFile(missing, "prod") + " is missing; the stack's registries, Gateway names, " +
+				"Envoy Gateway namespace, external components, StorageClass and HA mode are not used",
+		},
+		"with the cluster-validator and --mode": {
+			args: []string{"--control-plane", "--env", "prod", "--control-plane-stack", missing,
+				"--cluster-validator-image", pinnedValidatorImage, "--mode", "none"},
+			category: "control-plane-cluster",
+			message: envFile(missing, "prod") + " is missing; the stack's registries, Gateway names, " +
+				"Envoy Gateway namespace, external components and StorageClass are not used",
+		},
+		"compute plane": {
+			args:     []string{"--compute-plane", "--env", "prod", "--compute-plane-stack", missing},
+			category: "compute-plane-cluster", message: envFile(missing, "prod") + " is missing" + leftOut,
+		},
+		"compute plane checked before its install": {
+			args: []string{"--pre", "--control-plane", "--env", "prod", "--control-plane-stack", valid,
+				"--compute-plane-stack", missing},
+			category: "compute-plane-cluster", message: envFile(missing, "prod") + " is missing" + leftOut,
+		},
+		"--all reads the control plane's registries": {
+			args: []string{"--all", "--env", "prod", "--control-plane-stack", valid, "--compute-plane-stack", missing},
+		},
+		"--pre reads the control plane's registries": {
+			args: []string{"--pre", "--env", "prod", "--control-plane-stack", valid, "--compute-plane-stack", missing},
+		},
+		"--pre --compute-plane reads the control plane's registries": {
+			args: []string{"--pre", "--compute-plane", "--env", "prod", "--control-plane-stack", valid,
+				"--compute-plane-stack", missing},
+		},
+		"control plane unused without the cluster-validator": {
+			args: []string{"--pre", "--control-plane", "--env", "prod", "--control-plane-stack", missing,
+				"--compute-plane-stack", valid},
+		},
+		"no named environment": {args: []string{"--control-plane", "--control-plane-stack", missing}},
+		"readable file":        {args: []string{"--control-plane", "--env", "prod", "--control-plane-stack", valid}},
+		"--local-only": {
+			args: []string{"--all", "--local-only", "--env", "prod", "--control-plane-stack", missing,
+				"--compute-plane-stack", missing},
+		},
+		"unextracted oci stack": {
+			args: []string{"--control-plane", "--env", "prod", "--control-plane-stack", "oci://r.example.com/s:1"},
+		},
+		"file:// stack": {args: []string{"--control-plane", "--env", "prod", "--control-plane-stack", "file://" + missing}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "named with HELMFILE_ENV" {
+				t.Setenv("HELMFILE_ENV", "staging")
+			}
+			run := runCheck(t, checkStubs{}, tc.args...)
+			assert.Equal(t, 0, run.code(), "a warning does not fail the run\n%s", run.stderr)
+			var rows []map[string]any
+			for _, e := range checkEvents(t, run.stderr, "check_completed") {
+				if e["id"] == "stack-environment" {
+					rows = append(rows, e)
+				}
+			}
+			if tc.message == "" {
+				assert.Empty(t, rows)
+				return
+			}
+			require.Len(t, rows, 1, run.stderr)
+			assert.Equal(t, tc.category, rows[0]["category"])
+			assert.Equal(t, false, rows[0]["passed"])
+			assert.Equal(t, "warning", rows[0]["severity"])
+			assert.Equal(t, "stack values not read: "+tc.message, rows[0]["message"])
+		})
+	}
+}
+
 // check --pre without --env grades the registries of the environment up
 // installs, so an NGC repository the key cannot pull from fails the gate.
 func TestCheck_PreGradesTheRegistriesUpInstallsFrom(t *testing.T) {

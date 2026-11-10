@@ -159,8 +159,13 @@ when they describe the install:
   default is used only for a plane `--pre` checks before its install,
   since `up` installs with it. Otherwise pass the `--env` the install used.
 - `environments/<env>.yaml` is read, layered over `base.yaml`. `base.yaml`
-  alone is not used: when `<env>.yaml` cannot be read or is not valid YAML,
-  nothing is read from the stack.
+  alone is not used: when `<env>.yaml` is missing, is not a regular file,
+  cannot be read or is not valid YAML, neither these settings nor the
+  registries are read from that stack. Where the run would use that stack,
+  a `stack-environment` warning row names the file: in the control plane's
+  cluster category when the control plane is checked with the validator or
+  the registry check belongs to it, and in the compute plane's when the
+  registry check belongs to the compute plane.
 - The file comes from the stack the install used: `--control-plane-stack`
   (`--compute-plane-stack` for the registries when the registry check
   belongs to the compute plane), else the CLI's built-in stack. A local
