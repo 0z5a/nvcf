@@ -25,8 +25,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // WebhookConfig configures the in-agent admission webhook server.
@@ -65,6 +65,10 @@ type WebhookConfig struct {
 	DynamoLeaseTTL int
 	// CaptureLivenessBudget is webhook.Mutator.CaptureLivenessBudget.
 	CaptureLivenessBudget int
+	// CaptureHold is webhook.Mutator.CaptureHold: a pod a capture may
+	// freeze is held out of service until its capture is settled
+	// (capture_hold.go).
+	CaptureHold bool
 
 	// CacheSalt is folded into every cache identity the webhook composes
 	// (rootfsonly.HashInputComposer.Salt). Bump it to start fresh captures
@@ -239,6 +243,12 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// their liveness probes widened.
 		mut.CaptureCandidate = a.captureCandidate
 		mut.CRIUCapture = true
+		// The node agents release held pods (startCRIUAutoRestore runs
+		// whenever CRIU is the default).
+		mut.CaptureHold = cfg.CaptureHold
+		if a.kubeClient != nil {
+			mut.CaptureHoldAdmits = a.captureHoldAdmits
+		}
 	}
 	if a.kubeClient != nil {
 		mut.Kube = a.kubeClient
@@ -251,6 +261,8 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		if criuIsDefault() {
 			// Helm instances restore from their group captures.
 			mut.CRIUGroups = a.lookupCRIUGroupFor
+			// A configuration CRIU cannot serve falls back to the caches.
+			mut.CRIUFallback = a.criuFallbackFor
 			mut.CRIUGroupAdmits = a.criuGroupAdmits
 			mut.CRIUCompanionAdmits = a.criuCompanionAdmits
 			mut.CRIUCompanionSlot = a.claimCompanionSlot

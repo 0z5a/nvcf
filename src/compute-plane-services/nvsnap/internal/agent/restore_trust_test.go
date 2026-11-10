@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // trustFixture is an agent with two tenants: "victim" has a lone capture
@@ -276,6 +277,8 @@ func TestEndGroup_BlocksOnlyVouchedCheckpoints(t *testing.T) {
 	if _, err := kc.CoreV1().Pods("fn").Create(ctx, &extra, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// A failure that blocks the capture: its last allowed one.
+	setRecord(t, kc, map[string]string{groupRestoreFailuresKey: strconv.Itoa(criuGroupMaxRestoreFailures - 1)})
 	c.failGroup(ctx, leader, "k1", true, context.DeadlineExceeded, logrus.NewEntry(logrus.New()))
 	if !c.Blocked(ctx, "c0") || !c.Blocked(ctx, "c1") {
 		t.Error("the group's own checkpoints must be blocked")

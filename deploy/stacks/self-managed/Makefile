@@ -30,6 +30,7 @@ test:
 	@tests/check-llm-pki-issuer.sh
 	@tests/pdb-value-wiring.sh
 	@tests/pod-annotations-wiring.sh
+	@tests/openbao-auto-unseal-wiring.sh
 	@tests/invocation-env-wiring.sh
 	@tests/invocation-tracing-baggage.sh
 	@tests/java-tracing-env-wiring.sh
@@ -53,6 +54,7 @@ test:
 	@tests/nonroot-ui-migrations.sh
 	@tests/ha-value-wiring.sh
 	@tests/ha-chart-render.sh
+	@tests/worker-callback-proxy-wiring.sh
 
 test-published-charts:
 	@: "$${NVCF_PUBLISHED_CHART_REGISTRY:?NVCF_PUBLISHED_CHART_REGISTRY is required}"

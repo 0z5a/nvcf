@@ -36,7 +36,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	golibversion "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
+	golibversion "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 )
 
 const (
@@ -106,6 +106,12 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 	modelDirector, err := NewModelDirector(mappings, re, vanityDirector, llmGatewayDirector, shadower)
 	if err != nil {
 		return nil, err
+	}
+	if serverConfig.NvcfControlPlaneEndpoint != "" {
+		modelDirector.privateModels, err = sharedPrivateModelAccess(serverConfig.NvcfControlPlaneEndpoint, transport)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	serverTelemetry := middleware.ServerTelemetryMiddleware()
@@ -193,6 +199,7 @@ func registerModelAPIs(hostRouter *middleware.HostRouter, mappings *config.Gatew
 	r.Get("/v1/models", modelDirector.ListModels)
 	r.Get("/v1/models/{model}", modelDirector.GetModel)
 	r.Get("/v1/models/{company}/{model}", modelDirector.GetModel)
+	r.Get("/v1/models/{prefix}/{company}/{model}", modelDirector.GetModel)
 
 	r.Get(healthPath, healthManager.HandlerFunc)
 	r.Get("/info", golibversion.Handler().ServeHTTP)

@@ -16,7 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // A CRIU checkpoint holds the process's memory: its tokens, keys and
@@ -117,7 +117,11 @@ func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook
 		a.log.WithError(err).WithField("namespace", ns).Warn("CRIU group restore: cannot read the namespace's scope; cold start")
 		return webhook.CRIUGroup{}, false
 	}
-	g, ok := a.lookupCRIUGroup(ctx, criuGroupKey(uri, scope))
+	key := criuGroupKey(uri, scope)
+	g, ok := a.lookupCRIUGroup(ctx, key)
+	if ok {
+		a.nameRecordLater(key, ns)
+	}
 	if ok && g.VerifyNamespace != "" && g.VerifyNamespace != ns {
 		// Not verified yet: only its own instance restores from it.
 		return webhook.CRIUGroup{}, false

@@ -50,9 +50,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	sigsyaml "sigs.k8s.io/yaml"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/db"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/db"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 )
 
 var (
@@ -343,6 +343,18 @@ func (s *Server) Run(ctx context.Context) error {
 		Elections:  s.electionReleaser(),
 	}
 	go rec.Run(ctx)
+
+	// One NvsnapFunction per function version the capture records name:
+	// which functions are cached, readable by kubectl.
+	if s.kubeClient != nil && s.dynClient != nil {
+		functions := &FunctionStatus{
+			KubeClient: s.kubeClient,
+			DynClient:  s.dynClient,
+			Namespace:  captureManifestNamespace,
+			Log:        s.log.WithField("subsys", "function-status"),
+		}
+		go functions.Run(ctx)
+	}
 
 	go func() {
 		<-ctx.Done()

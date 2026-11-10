@@ -45,6 +45,7 @@ Configuration is passed through environment variables.
 | `MAPPING_PATH` | Yes | None | Path to the rendered mapping config file. |
 | `MAPPING_LOAD_TIMEOUT` | No | `15s` | Maximum time to wait at startup for `MAPPING_PATH` to appear. Increase this when a ConfigMap projection or remote-config sidecar materializes the file after the main container starts. Duration strings require a unit, such as `2m` or `90s`. A value without a unit is rejected when configuration is loaded, and a negative value is rejected at startup. |
 | `NVCF_API_ENDPOINT` | No | Service default | Upstream invocation service endpoint. In cluster deployments, this usually points to the in-cluster invocation service. |
+| `NVCF_CONTROL_PLANE_ENDPOINT` | No | Empty | NVCF API base URL used to list the private models a caller's API key may access. Empty disables private model listing. See [Private Models](#private-models). |
 | `LLM_GATEWAY_ENDPOINT` | No | Empty | Upstream LLM Gateway endpoint. Required only when a model sets `functionType: LLM`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Empty | OTLP endpoint for tracing. Empty disables OTLP export. |
 | `TRACING_ACCESS_TOKEN` | No | Empty | Access token for OTLP tracing. Also configurable in the secrets file under `$.tracingAccessToken`. |
@@ -127,6 +128,17 @@ for OpenAI-compatible endpoints and `path` for Vanity URL routes.
 When `usePexec` is false or omitted, the gateway forwards to `NVCF_API_ENDPOINT`
 with `function-id` and `function-version-id` headers. When `usePexec` is true,
 the gateway rewrites the upstream path to the pexec endpoint instead.
+
+When a model route or Vanity URL route invokes a function through the
+invocation service, with or without `usePexec`, the gateway removes the
+caller's `X-Api-Key` and `Cookie` headers before forwarding, so these
+credentials never reach the function. `Authorization` is
+forwarded: the invocation service authenticates the request with it and removes
+it before the function sees the request. The invocation service does not read
+`X-Api-Key`, so a Messages request that authenticates only with `x-api-key` is
+rejected there with `401`. Configured `customHeaders` are set after this step.
+Models with `functionType: LLM` keep both headers, see
+[LLM Function Models](#llm-function-models).
 
 ```yaml
 v2config:
@@ -386,7 +398,8 @@ these requests. The LLM Gateway resolves the function from the model, so the
 gateway sets none of them, and a caller-supplied value is removed rather than
 forwarded: the mapping is what decides which function a caller reaches.
 Vanity Gateway passes `Authorization`, `NVCF-POLL-SECONDS`, and the caller's
-other headers to the LLM Gateway.
+other headers, including `X-Api-Key` and `Cookie`, to the LLM Gateway. The LLM
+Gateway accepts the API key in `x-api-key` on Messages requests.
 
 Config validation rejects `functionType: LLM` outside the supported
 sections, and rejects `usePexec`, `outgoingPathOverride`, and `sessionTimeout`
@@ -524,6 +537,64 @@ Config reloads refresh metadata. Invalid configuration keeps the last accepted
 snapshot. Metadata advertises configured values only; it adds no upstream
 lookup or limit enforcement. Anthropic-shaped discovery keeps its existing
 schema, including for aliases shared with OpenAI sections.
+
+### Private Models
+
+`GET /v1/models` lists public model names. When the request carries an NVCF
+API key in `Authorization: Bearer`, the list also includes the private models
+that key may access:
+
+```shell
+curl -s -H "Host: api.example.com" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
+  http://localhost:10081/v1/models
+```
+
+The gateway does not validate the key. It sends the key to
+`GET /v2/nvcf/functions?visibility=authorized,private` on
+`NVCF_CONTROL_PLANE_ENDPOINT`, and the NVCF API applies the same account and
+API key resource checks as invocation, version by version. A model whose name
+matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
+the function version it routes to. An entry without `functionVersionID` is
+listed when any version of its function is returned. Expiry,
+`supported_endpoints`, and metadata follow the public-model rules, and
+Anthropic clients get the same models in the Anthropic shape. An alias can
+route to different functions per section. A key sees it only for the sections
+whose route it may use: `supported_endpoints` lists only those, and Anthropic
+clients see the alias only when its Messages route is usable.
+
+`GET /v1/models/{model}` follows the same rule, including three-part names
+such as `private/acme/model`. A private name returns its model only when the
+key may access the function version it routes to. Otherwise the response is
+the same 404 as for an unknown name.
+
+The lookup never fails a request:
+
+| Case | Response |
+| --- | --- |
+| No bearer key | Public list, no NVCF API call |
+| Key accepted | Public list plus the private models the key may access |
+| NVCF API rejects the key (`401`) | Public list |
+| Key has no `list_functions` or `list_functions_details` scope (`403`) | Public list |
+| NVCF API error, timeout, or redirect | The key's last successful result if it is under 15 minutes old, otherwise the public list. The key is not looked up again for 10 seconds. |
+| `NVCF_CONTROL_PLANE_ENDPOINT` not set | Public list, no NVCF API call |
+
+Keyed responses carry `Cache-Control: private, no-store` and
+`NVCF-Private-Models`, which reports the lookup result: `authorized`,
+`unauthenticated`, `forbidden`, or `unavailable`. The NVCF API can answer
+`403` for an unrecognized `nvapi-` key, so that key reports `forbidden`. Model
+list responses carry `Vary: Authorization`.
+
+Results are cached per key for one minute, for up to 4096 keys, and survive
+mapping reloads. A reload that changes the set of private functions refreshes
+each key on its next request. Concurrent requests with the same key share one
+lookup. Each pod runs at most 16 lookups at once, each with a 5 second
+timeout, and a request never waits for a free slot. Keys without an
+authorized result share a per-pod budget of 50 lookups per second, so random
+tokens cannot drive NVCF API calls. Without a private alias in the mapping,
+there is no lookup. The lookup never follows a redirect, so the key goes only
+to `NVCF_CONTROL_PLANE_ENDPOINT`. A request that the gateway skips under these
+limits gets the key's last successful result or the public list.
 
 ## Invoking the Anthropic Messages Endpoint
 
@@ -804,6 +875,17 @@ combinations are emitted at zero on startup. The primary request span records
 the deciding methods in the `shadow.sampling_methods` attribute. Neither
 records cache keys, credentials, or message content.
 
+`nvcf_ai_api_gateway_private_model_lookups_total` counts private model access
+lookups. The `result` label is `authorized`, `unauthenticated`, `forbidden`,
+`unavailable`, or `limited`. The `cached` label is `true` for cache hits. A
+failed lookup counts as `unavailable` even when the key's last successful
+result is served, and a request inside the retry window after a failure counts
+as a cached `unavailable`. `limited` counts lookups the gateway skipped under
+its own limits.
+Requests that share an in-flight lookup are not counted again. All label
+combinations are emitted at zero on startup. The request span records
+`private_models.cached` and `private_models.result`.
+
 Every response on the model API host (`openai.host`) carries one
 `X-Request-Id`. The gateway keeps the caller's value or creates a UUID and sends
 the same value upstream, so the LLM Gateway logs the request under the same ID.
@@ -842,7 +924,8 @@ labels to distinguish calls and failures:
 
 - `gateway_call_kind` is `inference` for proxied requests (including shadows),
   `poll` for status polls on `/v1/status/{requestId}`, which can long-poll for
-  minutes, and `health` for upstream readiness checks.
+  minutes, `health` for upstream readiness checks, and `model_access` for
+  private model access lookups to the NVCF API.
 - `error_source` is present on non-2xx responses. It accepts
   `invocation_service` or `worker` from the upstream `NVCF-Error-Source`
   response header. Missing or unrecognized values become `unknown`.

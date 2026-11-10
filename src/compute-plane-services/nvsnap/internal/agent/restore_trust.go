@@ -33,8 +33,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // restoreRecordsDir holds the agent's record of each pod it restored on
@@ -343,6 +343,12 @@ func (c *criuAutoRestorer) restoreRefusal(ctx context.Context, pod *corev1.Pod) 
 // forgetPod drops what the restorer keeps about a pod that is gone.
 func (c *criuAutoRestorer) forgetPod(pod *corev1.Pod) {
 	c.dropRestoreRecord(pod.UID)
+	c.forgetFallback(pod.UID)
+	c.readyObserved.Delete(pod.UID)
+	c.captureDecided.Delete(pod.UID)
+	c.bundleWaitSince.Delete(pod.UID)
+	c.agentWaitSince.Delete(pod.UID)
+	c.attempted.Delete("capture/" + string(pod.UID))
 	prefix := string(pod.UID) + "\x00"
 	c.verdicts.Range(func(k, _ any) bool {
 		if strings.HasPrefix(k.(string), prefix) {

@@ -24,7 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 )
 
 // The rootfs L2 restore (rootfs_l2_overlay.go) runs nvsnap-rootfs-restore
@@ -203,6 +203,26 @@ func (m *Mutator) bundleDir(id string) string {
 // bundle root.
 const BundleVersionsDir = "versions"
 
+// BundleCompanionDir holds, under the bundle root, one directory per
+// version for the pods without GPUs a capture may dump (companions). The
+// agent of a node mounts the staged version there, read-only; on a node no
+// agent runs on it stays an empty directory, which the kubelet creates, so
+// a companion starts on any node (docs/design/VERSIONED-NODE-BUNDLE.md).
+// Its paths end in /versions/<id>, as a version's own do, so that every
+// agent version, those before companion directories included, counts a
+// companion's version as in use and keeps it on the node.
+const BundleCompanionDir = "companion/" + BundleVersionsDir
+
+// companionBundleDir is the host directory a companion mounts version id
+// from (BundleCompanionDir).
+func (m *Mutator) companionBundleDir(id string) string {
+	root := m.HostBundleRoot
+	if root == "" {
+		root = DefaultHostBundleRoot
+	}
+	return root + "/" + BundleCompanionDir + "/" + id
+}
+
 // BundleMeta is the checkpoint metadata key naming the node bundle version
 // its pod mounted.
 const BundleMeta = "bundle"
@@ -230,7 +250,6 @@ func PodBundleID(pod *corev1.Pod) string {
 // a restore placeholder mounts its checkpoint's version for the restored
 // process and the current one for the helper.
 func PodBundleIDs(pod *corev1.Pod) []string {
-	marker := "/" + BundleVersionsDir + "/"
 	var ids []string
 	seen := map[string]bool{}
 	for i := range pod.Spec.Volumes {
@@ -238,6 +257,9 @@ func PodBundleIDs(pod *corev1.Pod) []string {
 		if v.HostPath == nil {
 			continue
 		}
+		// A version a pod mounts directly, or through the companion
+		// directory its agent mounts it on (which ends the same way).
+		marker := "/" + BundleVersionsDir + "/"
 		j := strings.LastIndex(v.HostPath.Path, marker)
 		if j < 0 {
 			continue

@@ -18,8 +18,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/modelid"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelid"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 )
 
 const (
@@ -48,6 +48,9 @@ func helperMount() corev1.VolumeMount { return modelvolume.HelperMount() }
 type AgentPlacement struct {
 	NodeSelector map[string]string    `json:"nodeSelector,omitempty"`
 	NodeAffinity *corev1.NodeAffinity `json:"nodeAffinity,omitempty"`
+	// Tolerations are the agent's; a node with a taint they do not
+	// tolerate gets no agent. Not added to the pods the webhook places.
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 // onAgentNodes returns the pod's nodeSelector with the agent's added, and

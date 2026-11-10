@@ -41,7 +41,7 @@ api:
     # This sets the pull policy for images.
     pullPolicy: IfNotPresent
     # Overrides the image tag whose default is the chart appVersion.
-    tag: "1.28.4"
+    tag: "1.29.3"
 
   # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
   # imagePullSecrets:
@@ -271,7 +271,7 @@ api:
           inference-container: nvcr.io/nvidia/tritonserver:23.04-py3
           otel-container: dummy
           niclls-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf_worker_niclls:2.118.2
-          ess-agent-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/ess-agent:1.4.1
+          ess-agent-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/ess-agent:1.4.5
           otel-collector-container: ""
           llm-router-client-image: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/pylon:0.15.1
         notary:

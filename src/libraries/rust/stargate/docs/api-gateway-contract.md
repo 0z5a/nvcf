@@ -93,11 +93,16 @@ Response:
 - `model_ids`: model ids with a current routable target generation in the
   selected pod's local state.
 
-`ListModels` is a hint, not a reservation. If a recent positive result is
-followed by proxy `404` with `x-stargate-error-code: no_eligible_candidates`,
-the local route changed after discovery returned; the gateway may retry
-according to its normal policy. A `503` for a registered model means no
-eligible active backend, not a discovery miss.
+`ListModels` is a hint, not a reservation. It lists only models with a
+routable backend now. A model whose backends are inactive, or whose last
+backend deregistered within `--deregistered-model-grace-ms` (default 900000,
+15 minutes), gets proxy `503` with `x-stargate-error-code: no_ready_backends`
+and `Retry-After`. This covers backend replacement, where the old backend
+leaves before the new one registers. A `404` with
+`x-stargate-error-code: no_eligible_candidates` means no backend advertised the
+model on this pod within that window. If a recent positive result is followed
+by that `404`, the local route changed after discovery returned; the gateway
+may retry according to its normal policy.
 
 ## Operator Debug State
 
@@ -226,9 +231,11 @@ Common errors:
 | `500` | `internal_error` | Stargate could not build the response. | Treat as serving failure. |
 | `502` | `upstream_unreachable` | Tunnel or transport failure. | Treat as serving failure. |
 | `503` | `no_available_backend` | No backend could take the request. | Treat as serving failure. |
+| `503` | `no_ready_backends` | Known target with no ready backend: inactive, recently deregistered, or every backend failed this request. Carries `Retry-After`. | Retryable. Relay `Retry-After`. |
 | `503` | `overloaded_error` | Capacity or admission rejection. | Treat as serving failure. |
 | `503` | `local_connect_failure` | Pylon could not connect to its model server. | Treat as serving failure. |
 | `503` | `model_generation_unavailable` | Pylon has not admitted the model generation. | Treat as serving failure. |
+| `504` | `upstream_timeout` | The request was sent, but Pylon sent no response headers before `--quic-request-timeout-ms`. A timeout while opening the tunnel stream returns `502`. | Treat as serving failure. |
 
 Stargate strips pylon retry metadata before returning downstream:
 `x-stargate-retryable`, `x-stargate-retry-reason`,
@@ -249,11 +256,14 @@ metadata and does not forward the upstream header downstream.
 
 Queued requests can wait a long time before their first output. Stargate waits
 up to `--quic-request-timeout-ms` (default 300000) for response headers from
-Pylon. After the engine returns headers, Pylon waits up to
-`--pylon-first-output-timeout-ms` (default 300000) for the first streamed output
-and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs. The two
-waits run one after the other, so a single attempt can wait for their sum before
-its first output, and each retry can wait that long again.
+Pylon. When that wait ends, Stargate returns `504` and drops the tunnel stream.
+Pylon then cancels the engine request, as it does when the caller disconnects.
+This works over raw QUIC tunnels, direct or through `stargate-k8s-router`, and
+over direct WebTransport tunnels. After the engine returns headers, Pylon waits
+up to `--pylon-first-output-timeout-ms` (default 300000) for the first streamed
+output and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs.
+The two waits run one after the other, so a single attempt can wait for their
+sum before its first output, and each retry can wait that long again.
 
 Gateway rules:
 

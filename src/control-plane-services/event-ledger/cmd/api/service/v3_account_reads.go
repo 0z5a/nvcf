@@ -27,7 +27,7 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
 )
 
 // accountPathParams reads and validates the account, function, and function
@@ -130,6 +130,7 @@ func (s *Server) GetAccountEventsV3(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		details.Body = decodeEventBody(details.Body)
 		if !attributeMatches(details, attributeKey, attributeValue) {
 			continue
 		}

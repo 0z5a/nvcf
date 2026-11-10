@@ -34,7 +34,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/capturehold"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 )
 
 // DefaultCaptureLabel is the pod-label key the agent watches for capture
@@ -396,16 +397,12 @@ func (w *Watcher) isLabeledForCapture(pod *corev1.Pod) bool {
 }
 
 // IsPodReady reports whether pod's PodReady condition is True.
+//
+// A pod nvsnap holds out of service until its capture is settled
+// (capturehold) counts as Ready once it is warm: the hold is there so
+// that it is captured before it serves, not to delay its capture.
 func IsPodReady(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
+	return capturehold.Ready(pod)
 }
 
 func (w *Watcher) validate() error {

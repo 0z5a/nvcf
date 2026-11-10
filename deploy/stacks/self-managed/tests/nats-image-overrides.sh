@@ -29,16 +29,24 @@ write_values() {
 
 printf '{}\n' > "$environment_file"
 write_values "$work_dir/default.yaml"
+assert_equal "$(yq -r '.nats.container.image | .registry + "/" + .repository + ":" + .tag' "$work_dir/default.yaml")" \
+  'docker.io/synadia/nats-server:2.14.9-alpine3.22' 'patched server default'
+assert_equal "$(yq -r '.nats.reloader.image.tag' "$work_dir/default.yaml")" \
+  '0.25.0' 'patched reloader default'
+assert_equal "$(yq -r '.nats.natsBox.container.image.tag' "$work_dir/default.yaml")" \
+  "$(yq -r '.nats.natsBox.container.image.tag' "$repo_root/deploy/helm/nats/values.yaml")" 'box tag matches owning chart'
 assert_equal "$(yq '.nats.natsBox.podTemplate' "$work_dir/default.yaml")" null 'no unconditional box policy'
 # The NVCF image registry must not redirect this upstream diagnostic image.
 assert_equal "$(yq '.nats.natsBox.container.image.registry' "$work_dir/default.yaml")" docker.io 'default box registry'
 assert_equal "$(yq '.nats.natsBox.container.image.repository' "$work_dir/default.yaml")" natsio/nats-box 'default box repository'
 printf 'global:\n  image:\n    registry: mirror.example.com\n    repository: team/nvcf\n' > "$environment_file"
 write_values "$work_dir/global-mirror.yaml"
+assert_equal "$(yq -o=json -I=0 '.nats.container.image | sort_keys(.)' "$work_dir/global-mirror.yaml")" \
+  "$(yq -o=json -I=0 '.nats.container.image | sort_keys(.)' "$work_dir/default.yaml")" 'server independent of NVCF registry'
 assert_equal "$(yq -o=json -I=0 '.nats.natsBox.container.image | sort_keys(.)' "$work_dir/global-mirror.yaml")" \
   "$(yq -o=json -I=0 '.nats.natsBox.container.image | sort_keys(.)' "$work_dir/default.yaml")" 'box independent of NVCF registry'
 # Exercise the documented environment block, not a second copy of its pins.
-awk '/^### Use upstream NATS images/{section=1; next} section && /^```yaml$/{block=1; next} block && /^```$/{exit} block' "$manifest" > "$environment_file"
+awk '/^### Run the upstream NATS images as non-root/{section=1; next} section && /^```yaml$/{block=1; next} block && /^```$/{exit} block' "$manifest" > "$environment_file"
 test -s "$environment_file" || fail 'missing documented environment example'
 write_values "$work_dir/upstream.yaml"
 for path in container reloader natsBox.container; do

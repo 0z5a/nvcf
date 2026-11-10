@@ -39,7 +39,8 @@ When enabled, the stack creates:
 
 - `llm-api-gateway` in the `nvcf` namespace.
 - `llm-request-router` in the `nvcf` namespace.
-- The `llm.invocation.<domain>` HTTPRoute when Gateway API ingress is enabled.
+- The `llm.<domain>` and `llm.invocation.<domain>` HTTPRoutes when Gateway API
+  ingress is enabled.
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
 
@@ -58,8 +59,8 @@ services:
   unless `certManager.enabled: false`.
 - Changed resources: the OpenBao migration Job, which creates the
   `services/all/pki/root` mount and the LLM policies, the NVCF API remote
-  configuration, and the `ingress` release, which adds the
-  `llm.invocation.<domain>` HTTPRoute and the LLM worker routes when enabled.
+  configuration, and the `ingress` release, which adds the `llm.<domain>` and
+  `llm.invocation.<domain>` HTTPRoutes and the LLM worker routes when enabled.
 - No existing Deployment or StatefulSet changes. Running non-LLM functions
   keep serving.
 
@@ -81,7 +82,7 @@ Before applying:
 3. Review the rendered change before applying:
 
    ```bash
-   cd path/to/nvcf-self-managed-stack
+   cd "$BUNDLE_DIR/deploy/stacks/self-managed"
    HELMFILE_ENV=<environment-name> helmfile --environment default diff --suppress-secrets
    ```
 
@@ -687,7 +688,7 @@ the API creates a new LLM function version.
 Apply the updated control-plane environment:
 
 ```bash
-cd path/to/nvcf-self-managed-stack
+cd "$BUNDLE_DIR/deploy/stacks/self-managed"
 make apply HELMFILE_ENV=<environment-name>
 ```
 
@@ -961,10 +962,10 @@ To remove the LLM addon from a running control plane:
    not affected.
 2. Set `addons.llm.enabled: false` in the environment file, or restore the
    environment file from before enablement, and apply the control-plane
-   stack. This removes the `llm.invocation.<domain>` route and clears the
-   LLM settings in the NVCF API remote configuration, so new LLM functions
-   can no longer be invoked or launched with the sidecar. No running
-   Deployment or StatefulSet changes.
+   stack. This removes the `llm.<domain>` and `llm.invocation.<domain>`
+   routes and clears the LLM settings in the NVCF API remote configuration,
+   so new LLM functions can no longer be invoked or launched with the
+   sidecar. No running Deployment or StatefulSet changes.
 3. Remove the addon releases. With the addon disabled, the Helmfile no longer
    contains these releases, so the apply leaves them installed and running
    instead of uninstalling them:
@@ -1083,8 +1084,15 @@ A `404` with `no eligible candidates` from `llm.invocation.<domain>` means the
 request reached the LLM Gateway, but the requested function or model was
 unknown or was not registered on the selected request router. The message is
 in `error.message`, as described in [Error Responses](#error-responses).
-Similar `503` candidate errors mean the router knows the target but has no
-active eligible backend. Check:
+A `503` with `no ready backends` means the router knows the model but no
+backend is ready, for example while the only instance is replaced or the model
+is still loading. The response carries `Retry-After`, and clients should retry.
+By default the router keeps a model known for 15 minutes after its last
+backend leaves, so a removed function returns this `503` before it returns
+`404`. The request router flag `--deregistered-model-grace-ms` sets this
+period, and `0` disables it. Each request router replica keeps this in
+memory, so a replica that never saw the model, or restarted since, returns
+`404` right away. Check:
 
 - The deployment became `ACTIVE` more than about one minute ago. The sidecar
   registers with the request routers after the pod is `Running`.

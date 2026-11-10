@@ -6,7 +6,7 @@ go_library(
         "modelvolume.go",
         "reaper.go",
     ],
-    importpath = "github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume",
+    importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume",
     visibility = ["//src/compute-plane-services/nvsnap:__subpackages__"],
     deps = [
         "@com_github_sirupsen_logrus//:logrus",
@@ -39,4 +39,14 @@ go_test(
         "@io_k8s_client_go//kubernetes/fake",
         "@io_k8s_client_go//testing",
     ],
+)
+
+# Sources read by internal/agent's TestAgentRBACCoversItsClientCalls.
+filegroup(
+    name = "go_srcs",
+    srcs = glob(
+        ["*.go"],
+        exclude = ["*_test.go"],
+    ),
+    visibility = ["//src/compute-plane-services/nvsnap/internal/agent:__pkg__"],
 )

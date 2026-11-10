@@ -3,7 +3,7 @@ nvctApi:
     registry: "" # must be supplied
     repository: "" # must be supplied
     pullPolicy: IfNotPresent
-    tag: "1.70.4"
+    tag: "1.70.5"
 
   # Namespace to deploy the resources. The default value is the release namespace.
   namespace: ""
@@ -129,7 +129,7 @@ nvctApi:
       nvct:
         sidecars:
           otel-container: dummy
-          ess-agent-container: "${nvct.sidecars.hostname}/${nvct.sidecars.repository}/ess-agent:1.4.1"
+          ess-agent-container: "${nvct.sidecars.hostname}/${nvct.sidecars.repository}/ess-agent:1.4.5"
           otel-collector-container: ""
 
   nodeSelector: {}

@@ -29,7 +29,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/criu/mountinfo"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/criu/mountinfo"
 )
 
 // excludeArgsForMountpoints converts a list of absolute container-side
@@ -219,6 +219,10 @@ func replayDiffOpts(excludeMountpoints []string) tarExtractOpts {
 	return tarExtractOpts{
 		skip:      func(name string) bool { return underAny(name, skipped) },
 		skipXattr: func(attr string) bool { return strings.HasPrefix(attr, "trusted.overlay.") },
+		// The placeholder's root comes from its own image, the source's,
+		// and is read-only when the pod's root filesystem is: restoring
+		// its owner failed the whole replay into such a pod.
+		keepRoot: true,
 	}
 }
 
