@@ -281,8 +281,8 @@ func TestReadModelRequestBodyRejectsDeclaredOverLimitWithoutReading(t *testing.T
 
 // TestStreamedRequestClientUploadFailureIsClientCanceled fails the client
 // upload after a streamed request was dispatched through a real transport.
-// The gateway must attribute it to the client, as a read failure before
-// dispatch was, not report an upstream proxy error.
+// The gateway must attribute it to the client, not report an upstream proxy
+// error.
 func TestStreamedRequestClientUploadFailureIsClientCanceled(t *testing.T) {
 	upstreamErr := make(chan error, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

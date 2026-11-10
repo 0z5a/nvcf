@@ -505,7 +505,8 @@ Failures after a streamed request is dispatched:
   truncated one.
 - If the client disconnects or the upload fails, the upstream request is
   aborted with an incomplete body and the gateway records `client_canceled`
-  (`499`), as for a disconnect before dispatch.
+  (`499`), not an upstream error. An upload that fails before dispatch still
+  returns `500`.
 - If the upstream has already started its response, the failure ends that
   response.
 - If the upstream answers before reading the whole body, the client receives

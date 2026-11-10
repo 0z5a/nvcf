@@ -160,7 +160,7 @@ func writeProxyError(writer http.ResponseWriter, request *http.Request, err erro
 		writeRequestTooLargeAfterDispatch(writer, request, maxBytesErr)
 	case errors.As(err, &bodyErr):
 		// A streamed upload that fails after dispatch is a client failure,
-		// as it was when the body was read before dispatch.
+		// not an upstream one, so it is not reported as 502.
 		writeClientClosedRequest(writer, request, err)
 	default:
 		writeBadGatewayProblem(writer, request, err)
