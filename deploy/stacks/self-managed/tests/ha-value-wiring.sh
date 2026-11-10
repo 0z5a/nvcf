@@ -121,6 +121,9 @@ done
 render_chart_values openbao-server "$work_dir/openbao-off.yaml" "$deps" || fail "render openbao (ha none)"
 grep -A3 "disruptionBudget:" "$work_dir/openbao-off.yaml" | grep -q "enabled: false" ||
   fail "openbao: server.ha.disruptionBudget must stay disabled when highAvailability.mode=none"
+if grep -q "publishNotReadyAddresses:" "$work_dir/openbao-off.yaml"; then
+  fail "openbao: service readiness override leaked while highAvailability.mode=none"
+fi
 
 echo "== highAvailability preferred: stateless / quorum sizing =="
 write_env <<'EOF'
@@ -183,6 +186,8 @@ grep -q "podAntiAffinity:" "$work_dir/openbao-on.yaml" ||
   fail "openbao: expected Tier-2 anti-affinity when highAvailability.mode=preferred"
 grep -A3 "disruptionBudget:" "$work_dir/openbao-on.yaml" | grep -q "maxUnavailable: 1" ||
   fail "openbao: expected server.ha.disruptionBudget maxUnavailable=1 when highAvailability.mode=preferred"
+grep -q "publishNotReadyAddresses: false" "$work_dir/openbao-on.yaml" ||
+  fail "openbao: client Services must exclude not-ready members under preferred HA"
 # base.yaml disables the budget for single-node installs; HA must turn it on,
 # or the chart renders no PDB for the Raft peers.
 grep -A3 "disruptionBudget:" "$work_dir/openbao-on.yaml" | grep -q "enabled: true" ||
@@ -360,6 +365,26 @@ EOF
   awk '/^invocation:/{p=1;next} /^[a-zA-Z]/{p=0} p' "$work_dir/grpcproxy-fixed.yaml" | grep -Eq "^  replicaCount:[[:space:]]*2$" ||
     fail "invocation-service: a fixed $fixed must not hold invocation-service at one replica"
 done
+
+# Under HTTP/3 each grpc-proxy pod puts its own IP in front of the base URL,
+# so a set workerConnectBaseURL no longer pins grpc-proxy to one pod.
+write_env <<'EOF'
+highAvailability:
+  mode: preferred
+grpcproxy:
+  workerConnectBaseURL: https://grpc-worker.example.com
+  http3:
+    enabled: true
+EOF
+render_chart_values grpc-proxy "$work_dir/grpcproxy-http3.yaml" "$core" ||
+  fail "render grpc-proxy (HTTP/3 with workerConnectBaseURL)"
+grpcproxy_http3="$(awk '/^grpcproxy:/{p=1;next} /^[a-zA-Z]/{p=0} p' "$work_dir/grpcproxy-http3.yaml")"
+grep -Eq "^  replicaCount:[[:space:]]*2$" <<<"$grpcproxy_http3" ||
+  fail "grpc-proxy: expected replicaCount 2 under HTTP/3 with a workerConnectBaseURL"
+grep -A3 "^  podDisruptionBudget:" <<<"$grpcproxy_http3" | grep -q "enabled: true" ||
+  fail "grpc-proxy: expected the HA PDB under HTTP/3 with a workerConnectBaseURL"
+test "$(yq -r '.grpcproxy.http3.enabled' "$work_dir/grpcproxy-http3.yaml")" = "true" ||
+  fail "grpc-proxy: grpcproxy.http3 must reach the chart when it decides the replica count"
 
 echo "== secrets file overrides: decisions use the fully merged values =="
 # The service releases layer secrets/<env>-secrets.yaml after global.yaml.gotmpl.
@@ -632,6 +657,8 @@ grep -q "whenUnsatisfiable: DoNotSchedule" <<<"$openbao_enforced" ||
   fail "openbao: expected hard zone spread when highAvailability.mode=enforced"
 grep -Eq '^ *component: "?server"?$' <<<"$openbao_enforced" ||
   fail "openbao: hard zone spread must select the server Pods only"
+grep -q "publishNotReadyAddresses: false" <<<"$openbao_enforced" ||
+  fail "openbao: client Services must exclude not-ready members under enforced HA"
 
 echo "== highAvailability sizing is a floor, not a replacement =="
 write_env <<'EOF'
