@@ -58,4 +58,11 @@ type RequestContext struct {
 	// (ncaId) rather than any one function. Empty when none applies.
 	AccountInputTokenRateLimit  string
 	AccountOutputTokenRateLimit string
+	// FunctionRequestRateLimit and FunctionUserRequestRateLimit are the
+	// function's request rate limits for this caller, resolved by NVCF API.
+	// RequestLimitAccount is the account they count against (the key owner's
+	// account, else OrgID). Empty limits mean no request limit applies.
+	FunctionRequestRateLimit     string
+	FunctionUserRequestRateLimit string
+	RequestLimitAccount          string
 }

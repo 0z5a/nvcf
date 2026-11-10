@@ -31,6 +31,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/ratelimit"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 type LimitResolver interface {
@@ -122,6 +123,71 @@ func (r CallerLimitResolver) ResolveLimits(
 	default:
 		return nil, nil
 	}
+}
+
+// FunctionRequestLimitResolver applies the function's request rate limits that
+// NVCF API resolved for this caller. The per-user limit comes first, then the
+// account limit, so a request refused per user does not use the account's
+// budget. Both count against the key owner's account (RequestLimitAccount,
+// else OrgID) and the function, without the project split token limits use.
+type FunctionRequestLimitResolver struct{}
+
+func (r FunctionRequestLimitResolver) ResolveLimits(
+	_ context.Context,
+	reqCtx *requestctx.RequestContext,
+	_ string,
+) ([]ratelimit.ResourceLimit, error) {
+	_ = r
+
+	if reqCtx == nil || reqCtx.RoutingKey == "" {
+		return nil, nil
+	}
+	account := reqCtx.RequestLimitAccount
+	if account == "" {
+		account = reqCtx.OrgID
+	}
+	if account == "" {
+		return nil, nil
+	}
+
+	var limits []ratelimit.ResourceLimit
+	if reqCtx.FunctionUserRequestRateLimit != "" && reqCtx.APIKeyID != "" {
+		limit, err := parseRequestRateLimit(reqCtx.FunctionUserRequestRateLimit)
+		if err != nil {
+			return nil, fmt.Errorf("parse function user request rate limit: %w", err)
+		}
+		limit.SubjectKey = fmt.Sprintf("nvcf:%s:user:%s:routing_key:%s", account, reqCtx.APIKeyID, reqCtx.RoutingKey)
+		limit.SubjectRepr = "caller of routing key `" + reqCtx.RoutingKey + "`"
+		limit.Level = ratelimit.LevelAPIKey
+		limits = append(limits, limit)
+	}
+	if reqCtx.FunctionRequestRateLimit != "" {
+		limit, err := parseRequestRateLimit(reqCtx.FunctionRequestRateLimit)
+		if err != nil {
+			return nil, fmt.Errorf("parse function request rate limit: %w", err)
+		}
+		limits = append(limits, scopedOrgLimit(limit, account, reqCtx.RoutingKey))
+	}
+	return limits, nil
+}
+
+// parseRequestRateLimit reads a function request rate limit such as "5-M" or
+// "5-S,300-H" into request windows. It reuses the token limit syntax; week and
+// month windows have no request equivalent.
+func parseRequestRateLimit(raw string) (ratelimit.ResourceLimit, error) {
+	parsed, err := parseTokenRateLimit(raw)
+	if err != nil {
+		return ratelimit.ResourceLimit{}, err
+	}
+	if parsed.tokensPerWeek != 0 || parsed.tokensPerMonth != 0 {
+		return ratelimit.ResourceLimit{}, fmt.Errorf("unsupported request rate limit window in %q", raw)
+	}
+	return ratelimit.ResourceLimit{
+		RequestsPerSecond: parsed.tokensPerSecond,
+		RequestsPerMinute: parsed.tokensPerMinute,
+		RequestsPerHour:   parsed.tokensPerHour,
+		RequestsPerDay:    parsed.tokensPerDay,
+	}, nil
 }
 
 // AccountLimitResolver applies the account-scoped token rate limit NVCF API resolves by
@@ -289,11 +355,27 @@ func (ctx *RateLimitContext) RevertAndRecalculateStats() {
 	}
 
 	for _, results := range ctx.Results {
-		for _, result := range results {
+		for dim, result := range results {
+			// Requests are counted at admission, so they stay counted.
+			if isRequestDimension(dim) {
+				continue
+			}
 			result.Revert()
 		}
 	}
 	ctx.calculateStats()
+}
+
+func isRequestDimension(dim ratelimit.LimitDimension) bool {
+	switch dim {
+	case ratelimit.RequestsPerSecond,
+		ratelimit.RequestsPerMinute,
+		ratelimit.RequestsPerHour,
+		ratelimit.RequestsPerDay:
+		return true
+	default:
+		return false
+	}
 }
 
 func (ctx *RateLimitContext) calculateStats() {
@@ -504,7 +586,7 @@ func (p *AdmissionPlan) CheckRequests(ctx context.Context) error {
 	)
 
 	for _, group := range p.groups {
-		rlCtx, err := checkRateLimit(ctx, p.rl, group.limits, requestsOnly, p.requestID)
+		rlCtx, err := admitRequests(ctx, p.rl, group.limits, requestsOnly, p.requestID)
 		if rlCtx != nil {
 			lastCtx = rlCtx
 		}
@@ -553,8 +635,11 @@ func (p *AdmissionPlan) CheckTokensAndFinalize(ctx context.Context) (*RateLimitC
 			continue
 		}
 
+		// Requests were counted in CheckRequests; commit tokens only.
+		tokensOnly := p.consumeRequest
+		tokensOnly.Requests = 0
 		for _, plan := range group.plans {
-			if _, commitErr := plan.Commit(ctx, p.consumeRequest); commitErr != nil {
+			if _, commitErr := plan.Commit(ctx, tokensOnly); commitErr != nil {
 				return nil, echo.NewHTTPError(http.StatusInternalServerError, commitErr.Error())
 			}
 		}
@@ -643,6 +728,58 @@ func getLimitGroups(
 	}
 
 	return []limitGroup{group}, nil
+}
+
+// admitRequests counts the request against each limit in order, consuming only
+// when it fits, so parallel requests cannot share the last slot. It stops at
+// the first limit that refuses, and a refused request costs nothing: windows and
+// earlier limits that took it are refunded, later limits are not charged.
+// Limits without request windows are not touched.
+func admitRequests(
+	ctx context.Context,
+	rl ratelimit.RateLimiter,
+	resourceLimits []ratelimit.ResourceLimit,
+	request ratelimit.ResourceRequest,
+	requestID string,
+) (*RateLimitContext, error) {
+	rlCtx := &RateLimitContext{
+		Applied: resourceLimits,
+		Results: make(rateLimitResults, 0, len(resourceLimits)),
+	}
+
+	limited := false
+	for _, resourceLimit := range resourceLimits {
+		results, err := ratelimit.ConsumeResourceLimit(ctx, rl, resourceLimit, request, requestID)
+		if err != nil {
+			return nil, err
+		}
+		rlCtx.Results = append(rlCtx.Results, results)
+		for _, result := range results {
+			if result != nil && !result.Allowed() {
+				limited = true
+				break
+			}
+		}
+		if limited {
+			break
+		}
+	}
+
+	if limited {
+		for i, results := range rlCtx.Results {
+			if err := ratelimit.RefundResourceLimit(ctx, rl, resourceLimits[i], results, requestID); err != nil {
+				telemetry.Logger(ctx).Warn().Err(err).Str("requestID", requestID).
+					Msg("could not refund a refused request; it stays counted until the window refills")
+			}
+		}
+	}
+
+	rlCtx.calculateStats()
+	if limited {
+		return rlCtx, echo.NewHTTPError(http.StatusTooManyRequests, "rate limit exceeded")
+	}
+
+	return rlCtx, nil
 }
 
 func checkRateLimit(
@@ -742,19 +879,28 @@ func scopedProjectLimit(
 	return limit
 }
 
+// chooseRequestResult returns the request window with the least room left, so
+// the request headers describe the window that binds first.
 func chooseRequestResult(
 	results map[ratelimit.LimitDimension]*ratelimit.RateLimitResult,
 ) *ratelimit.RateLimitResult {
+	var chosen *ratelimit.RateLimitResult
 	for _, dim := range []ratelimit.LimitDimension{
+		ratelimit.RequestsPerSecond,
 		ratelimit.RequestsPerMinute,
+		ratelimit.RequestsPerHour,
 		ratelimit.RequestsPerDay,
 	} {
-		if result := results[dim]; result != nil {
-			return result
+		result := results[dim]
+		if result == nil {
+			continue
+		}
+		if chosen == nil || result.RemainingValue() < chosen.RemainingValue() {
+			chosen = result
 		}
 	}
 
-	return nil
+	return chosen
 }
 
 func chooseTokenStats(
