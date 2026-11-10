@@ -167,7 +167,9 @@ struct Args {
         value_name = "NAME"
     )]
     otel_service_name: String,
-    /// Comma-separated upstream HTTP statuses that can be marked retryable
+    /// Comma-separated upstream HTTP statuses that can be marked retryable.
+    /// Pylon always marks 529 and 503, and in the dynamo backend mode a 404
+    /// with content-length 0.
     #[arg(
         long,
         default_value = DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -175,7 +177,8 @@ struct Args {
         value_name = "CODES"
     )]
     pylon_retryable_upstream_status_codes: String,
-    /// Require the upstream retry header before marking retryable statuses retryable
+    /// Require the upstream retry header before marking retryable statuses
+    /// retryable. The responses that Pylon always marks do not need the header.
     #[arg(
         long,
         action = clap::ArgAction::Set,
@@ -235,7 +238,8 @@ struct Args {
     #[arg(long, env = "PYLON_QUEUE_MISMATCH_RETRY_AFTER_MS", value_name = "MS")]
     pylon_queue_mismatch_retry_after_ms: Option<u64>,
     /// Engine dialect spoken to the local upstream: "dynamo" derives the
-    /// engine priority headers from x-priority, "passthrough" derives nothing
+    /// engine priority headers from x-priority and marks a 404 with
+    /// content-length 0 retryable, "passthrough" does neither
     #[arg(
         long,
         default_value = "dynamo",

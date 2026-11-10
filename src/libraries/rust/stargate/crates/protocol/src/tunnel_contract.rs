@@ -41,7 +41,6 @@ pub const RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED: &str = "chat_usage_rewrite_
 // backend retry header.
 pub const RETRY_REASON_UPSTREAM_OVERLOADED: &str = "upstream_overloaded";
 pub const RETRY_REASON_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
-pub const RETRY_REASON_UPSTREAM_SERVER_ERROR: &str = "upstream_server_error";
 pub const RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED: &str = "upstream_model_unregistered";
 
 pub const HEADER_INFERENCE_SERVER_ID: &str = "x-inference-server-id";

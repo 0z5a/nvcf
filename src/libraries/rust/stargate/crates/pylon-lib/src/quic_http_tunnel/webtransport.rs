@@ -272,6 +272,7 @@ mod tests {
         HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     };
 
+    use super::super::UpstreamBackend;
     use super::super::core::{PylonRetryConfig, build_response_headers};
 
     fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
@@ -292,8 +293,15 @@ mod tests {
         upstream_headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
 
         let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
-        let headers = build_response_headers(status, &upstream_headers, &retry, None, "inst-a")
-            .expect("WebTransport success headers should build");
+        let headers = build_response_headers(
+            status,
+            &upstream_headers,
+            &retry,
+            UpstreamBackend::default(),
+            None,
+            "inst-a",
+        )
+        .expect("WebTransport success headers should build");
         let head = webtransport_response_head(status, headers);
 
         assert_eq!(head.status, reqwest::StatusCode::TOO_MANY_REQUESTS);

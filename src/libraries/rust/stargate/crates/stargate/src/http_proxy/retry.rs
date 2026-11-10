@@ -20,7 +20,7 @@ use stargate_protocol::tunnel_contract::{
     HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED, RETRY_REASON_QUEUE_ESTIMATE_MISMATCH,
     RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED, RETRY_REASON_UPSTREAM_OVERLOADED,
-    RETRY_REASON_UPSTREAM_SERVER_ERROR, RETRY_REASON_UPSTREAM_UNAVAILABLE,
+    RETRY_REASON_UPSTREAM_UNAVAILABLE,
 };
 
 mod replay;
@@ -28,9 +28,6 @@ mod replay;
 pub(super) use replay::{ReplayReadiness, ReplayableRequestBody};
 
 const RETRY_REASON_RETRYABLE_PROXY_ERROR: &str = "retryable_proxy_error";
-// A request that crashes the engine fails with a 500 on every instance it
-// reaches, so it gets one other instance, not every one.
-const MAX_UPSTREAM_SERVER_ERROR_RETRIES: u32 = 1;
 const DEFAULT_RETRY_BUDGET_MS_HEADER: &str = "x-stargate-max-wait-ms";
 const DEFAULT_MAX_REPLAY_BODY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -110,7 +107,6 @@ pub(super) fn decide_upstream_response_retry(
     retry: &ProxyRetryConfig,
     retry_budget_remaining: bool,
     request_retries: u32,
-    server_error_retries: u32,
     replay_readiness: ReplayReadiness,
 ) -> RetryDecision<UpstreamRetry> {
     if !should_retry_upstream_response(status, headers, retry) {
@@ -121,10 +117,7 @@ pub(super) fn decide_upstream_response_retry(
     if !retry_budget_remaining {
         return retry_exhausted("retry_budget_exhausted");
     }
-    if request_retries >= retry.max_request_retries
-        || (retry_reason == RETRY_REASON_UPSTREAM_SERVER_ERROR
-            && server_error_retries >= MAX_UPSTREAM_SERVER_ERROR_RETRIES)
-    {
+    if request_retries >= retry.max_request_retries {
         return retry_exhausted(retry_reason);
     }
 
@@ -202,7 +195,6 @@ pub(super) fn is_model_server_error_reason(reason: &str) -> bool {
         reason,
         RETRY_REASON_UPSTREAM_OVERLOADED
             | RETRY_REASON_UPSTREAM_UNAVAILABLE
-            | RETRY_REASON_UPSTREAM_SERVER_ERROR
             | RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED
     )
 }
@@ -422,7 +414,7 @@ mod tests {
         let retry = ProxyRetryConfig::default();
         let headers = retry_headers("true", None);
 
-        for status in [529, 500, 404] {
+        for status in [529, 503, 404] {
             assert!(
                 should_retry_upstream_response(
                     StatusCode::from_u16(status).unwrap(),
@@ -437,36 +429,6 @@ mod tests {
             &headers,
             &retry
         ));
-    }
-
-    #[test]
-    fn upstream_server_error_is_retried_once_per_request() {
-        let retry = ProxyRetryConfig::default();
-        let headers = retry_headers("true", Some(RETRY_REASON_UPSTREAM_SERVER_ERROR));
-        let decide = |server_error_retries| {
-            decide_upstream_response_retry(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &headers,
-                &retry,
-                true,
-                1,
-                server_error_retries,
-                ReplayReadiness::Ready,
-            )
-        };
-
-        assert_eq!(
-            decide(0),
-            RetryDecision::Retry(UpstreamRetry::AlternateCluster(
-                RETRY_REASON_UPSTREAM_SERVER_ERROR.to_owned()
-            ))
-        );
-        assert_eq!(
-            decide(1),
-            RetryDecision::Final(FinalRetryDisposition::Exhausted(
-                RETRY_REASON_UPSTREAM_SERVER_ERROR.to_owned()
-            ))
-        );
     }
 
     #[test]
@@ -523,7 +485,6 @@ mod tests {
                 &retry,
                 true,
                 0,
-                0,
                 ReplayReadiness::Ready,
             ),
             RetryDecision::Retry(UpstreamRetry::AlternateCluster(
@@ -543,7 +504,6 @@ mod tests {
                 &headers,
                 &retry,
                 true,
-                0,
                 0,
                 ReplayReadiness::Ready,
             ),
@@ -565,7 +525,6 @@ mod tests {
                 &retry,
                 false,
                 0,
-                0,
                 ReplayReadiness::Ready,
             ),
             RetryDecision::Final(FinalRetryDisposition::Exhausted(
@@ -579,7 +538,6 @@ mod tests {
                 &retry,
                 true,
                 retry.max_request_retries,
-                0,
                 ReplayReadiness::PayloadTooLarge,
             ),
             RetryDecision::Final(FinalRetryDisposition::Exhausted(

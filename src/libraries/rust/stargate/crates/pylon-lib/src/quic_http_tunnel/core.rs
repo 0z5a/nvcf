@@ -32,8 +32,7 @@ use stargate_protocol::tunnel_contract::{
     HEADER_STARGATE_UPSTREAM_RETRYABLE, RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED,
     RETRY_REASON_QUEUE_ESTIMATE_MISMATCH, RETRY_REASON_UPSTREAM_ADMISSION_REJECTED,
     RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED, RETRY_REASON_UPSTREAM_OVERLOADED,
-    RETRY_REASON_UPSTREAM_SERVER_ERROR, RETRY_REASON_UPSTREAM_UNAVAILABLE,
-    is_internal_control_header,
+    RETRY_REASON_UPSTREAM_UNAVAILABLE, is_internal_control_header,
 };
 use stargate_telemetry::{
     inject_trace_context, parent_context_from_headers, traceparent_from_headers,
@@ -625,6 +624,7 @@ async fn relay_upstream_response(
         status,
         response.headers(),
         &app.retry,
+        app.upstream_backend,
         app.metrics.as_deref(),
         &app.inference_server_id,
     )
@@ -1269,6 +1269,7 @@ pub(super) fn build_response_headers(
     status: StatusCode,
     response_headers: &HeaderMap,
     retry: &PylonRetryConfig,
+    upstream_backend: UpstreamBackend,
     metrics: Option<&PylonMetrics>,
     inference_server_id: &str,
 ) -> Result<HeaderMap> {
@@ -1280,7 +1281,8 @@ pub(super) fn build_response_headers(
     let status_retryable = retry.retryable_upstream_status_codes.contains(&status);
     let admission_rejected =
         status_retryable && (!retry.require_upstream_retry_header || upstream_retry_header_present);
-    let backend_error_reason = backend_error_retry_reason(status, response_headers);
+    let backend_error_reason =
+        backend_error_retry_reason(status, response_headers, upstream_backend);
     let retryable = admission_rejected || backend_error_reason.is_some();
     let reason = if admission_rejected {
         RETRY_REASON_UPSTREAM_ADMISSION_REJECTED
@@ -1331,16 +1333,17 @@ pub(super) fn build_response_headers(
 fn backend_error_retry_reason(
     status: StatusCode,
     response_headers: &HeaderMap,
+    upstream_backend: UpstreamBackend,
 ) -> Option<&'static str> {
     match status.as_u16() {
         529 => Some(RETRY_REASON_UPSTREAM_OVERLOADED),
         503 => Some(RETRY_REASON_UPSTREAM_UNAVAILABLE),
-        500 => Some(RETRY_REASON_UPSTREAM_SERVER_ERROR),
         // Dynamo answers an empty 404 once the model has left its registry; a
         // 404 with a body is the model server's own answer to the request.
-        404 if response_headers
-            .get(CONTENT_LENGTH)
-            .is_some_and(|value| value.as_bytes() == b"0") =>
+        404 if upstream_backend == UpstreamBackend::Dynamo
+            && response_headers
+                .get(CONTENT_LENGTH)
+                .is_some_and(|value| value.as_bytes() == b"0") =>
         {
             Some(RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED)
         }
@@ -1631,9 +1634,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.text().await.unwrap(), "ok");
-        let forwarded =
-            build_response_headers(StatusCode::OK, &headers, &app.retry, None, "header-test")
-                .unwrap();
+        let forwarded = build_response_headers(
+            StatusCode::OK,
+            &headers,
+            &app.retry,
+            app.upstream_backend,
+            None,
+            "header-test",
+        )
+        .unwrap();
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded["x-end-to-end"], "preserved");
         server.shutdown().await;
@@ -1641,24 +1650,30 @@ mod tests {
 
     #[test]
     fn backend_errors_before_output_are_marked_retryable() {
-        // (label, status, content-length, backend retry header, expected retry reason)
+        use UpstreamBackend::{Dynamo, Passthrough};
+        // (label, backend mode, status, content-length, backend retry header,
+        // expected retry reason)
         #[rustfmt::skip] // one case per line
         let cases = [
-            ("overloaded", 529, Some("120"), false, Some("upstream_overloaded")),
-            ("not_ready", 503, Some("80"), false, Some("upstream_unavailable")),
-            ("signalled_503", 503, Some("80"), true, Some("upstream_admission_rejected")),
-            ("server_error", 500, Some("90"), false, Some("upstream_server_error")),
-            ("model_unregistered", 404, Some("0"), false, Some("upstream_model_unregistered")),
-            ("model_not_found", 404, Some("63"), false, None),
-            ("chunked_404", 404, None, false, None),
-            ("bad_gateway", 502, Some("20"), false, None),
-            ("gateway_timeout", 504, Some("20"), false, None),
-            ("unsignalled_429", 429, Some("20"), false, None),
-            ("signalled_429", 429, Some("20"), true, Some("upstream_admission_rejected")),
-            ("bad_request", 400, Some("20"), false, None),
-            ("ok", 200, Some("20"), false, None),
+            ("overloaded", Dynamo, 529, Some("120"), false, Some("upstream_overloaded")),
+            ("passthrough_overloaded", Passthrough, 529, Some("120"), false, Some("upstream_overloaded")),
+            ("not_ready", Dynamo, 503, Some("80"), false, Some("upstream_unavailable")),
+            ("signalled_503", Dynamo, 503, Some("80"), true, Some("upstream_admission_rejected")),
+            ("model_unregistered", Dynamo, 404, Some("0"), false, Some("upstream_model_unregistered")),
+            ("passthrough_empty_404", Passthrough, 404, Some("0"), false, None),
+            ("model_not_found", Dynamo, 404, Some("63"), false, None),
+            ("chunked_404", Dynamo, 404, None, false, None),
+            ("server_error", Dynamo, 500, Some("90"), false, None),
+            ("bad_gateway", Dynamo, 502, Some("20"), false, None),
+            ("gateway_timeout", Dynamo, 504, Some("20"), false, None),
+            ("unsignalled_429", Dynamo, 429, Some("20"), false, None),
+            ("signalled_429", Dynamo, 429, Some("20"), true, Some("upstream_admission_rejected")),
+            ("bad_request", Dynamo, 400, Some("20"), false, None),
+            ("ok", Dynamo, 200, Some("20"), false, None),
         ];
-        for (label, status, content_length, has_retry_header, expected_reason) in cases {
+        for (label, upstream_backend, status, content_length, has_retry_header, expected_reason) in
+            cases
+        {
             let mut upstream = HeaderMap::new();
             if let Some(content_length) = content_length {
                 upstream.insert(CONTENT_LENGTH, HeaderValue::from_static(content_length));
@@ -1669,11 +1684,13 @@ mod tests {
                     HeaderValue::from_static("true"),
                 );
             }
+            let metrics = PylonMetrics::new().expect("metrics should initialize");
             let forwarded = build_response_headers(
                 StatusCode::from_u16(status).unwrap(),
                 &upstream,
                 &PylonRetryConfig::default(),
-                None,
+                upstream_backend,
+                Some(&metrics),
                 "inst-a",
             )
             .unwrap();
@@ -1688,6 +1705,13 @@ mod tests {
                 expected_reason.map(|_| "true"),
                 "{label}"
             );
+            if let Some(reason) = expected_reason {
+                let sample = format!(
+                    r#"pylon_retryable_responses_total{{inference_server_id="inst-a",reason="{reason}",status="{status}"}} 1"#
+                );
+                let metrics = metrics.gather_text().expect("metrics should encode");
+                assert!(metrics.contains(&sample), "{label}:\n{metrics}");
+            }
         }
     }
 

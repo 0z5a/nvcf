@@ -154,6 +154,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::super::UpstreamBackend;
     use super::super::core::{
         PylonRetryConfig, RETRY_REASON_LOCAL_CONNECT_FAILURE, UpstreamRequestError,
         build_response_headers, local_connect_failure_headers, problem_response_headers,
@@ -219,9 +220,16 @@ mod tests {
         upstream_headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
 
         let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
-        let headers = build_response_headers(status, &upstream_headers, &retry, None, "inst-a")
-            .and_then(|headers| raw_quic_response_headers(status, headers))
-            .expect("raw QUIC success headers should build");
+        let headers = build_response_headers(
+            status,
+            &upstream_headers,
+            &retry,
+            UpstreamBackend::default(),
+            None,
+            "inst-a",
+        )
+        .and_then(|headers| raw_quic_response_headers(status, headers))
+        .expect("raw QUIC success headers should build");
 
         assert_eq!(header_value(&headers, "x-status"), "429");
         assert_eq!(header_value(&headers, HEADER_STARGATE_RETRYABLE), "true");

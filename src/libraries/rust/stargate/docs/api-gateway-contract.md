@@ -259,21 +259,33 @@ because it classifies the response head before any output reaches Stargate.
 `--pylon-retryable-upstream-status-codes` and
 `--pylon-require-upstream-retry-header` do not change this list.
 
-| Upstream response | `x-stargate-retry-reason` | Retries per request |
+| Upstream response | `x-stargate-retry-reason` | Pylon backend mode |
 | --- | --- | --- |
-| `529` | `upstream_overloaded` | `--proxy-max-request-retries` (default 2) |
-| `503` | `upstream_unavailable` | `--proxy-max-request-retries` (default 2) |
-| `404` with `content-length: 0` | `upstream_model_unregistered` | `--proxy-max-request-retries` (default 2) |
-| `500` | `upstream_server_error` | 1 |
+| `529` | `upstream_overloaded` | Every mode |
+| `503` | `upstream_unavailable` | Every mode |
+| `404` with `content-length: 0` | `upstream_model_unregistered` | `dynamo` only |
 
-A Dynamo frontend answers the empty `404` once the model has left its
-registry. A `404` with a body, `502`, and `504` pass through. Stargate retries
-each of these only on an instance this request has not tried. A `500` gets one
-retry, so a request that crashes the engine reaches at most two instances.
-When no untried instance is left, or the retries run out, the client gets the
-last model server response unchanged. If every instance that the request tried
+A Dynamo frontend answers a `404` with `content-length: 0` after the model
+leaves its registry. Pylon marks that response only with
+`--pylon-upstream-backend dynamo` (the default).
+
+Stargate retries each response in the table on a cluster that this request
+has not tried. The limit is `--proxy-max-request-retries` (default 2). A Pylon
+without `--cluster-id` is its own cluster, so the retry goes to a different
+instance.
+
+Pylon does not mark other model server errors in this way. A `500`, a `404`
+with a body, a `502`, and a `504` reach the client unchanged. A `500` can come
+from the request itself, so a different instance can fail in the same way.
+
+When no untried cluster is left, or the retries run out, the client gets the
+last model server response unchanged. If every cluster that the request tried
 answered `529`, the client gets `503` with `x-stargate-error-code:
 overloaded_error` instead.
+
+Known limitation: routing can reject the only untried cluster, for example
+when that cluster has no ready backend. The client then gets the `503` that
+Stargate returns for that routing result, not the last model server response.
 
 Queued requests can wait a long time before their first output. Stargate waits
 up to `--quic-request-timeout-ms` (default 300000) for response headers from

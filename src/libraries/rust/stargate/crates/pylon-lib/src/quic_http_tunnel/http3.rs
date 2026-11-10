@@ -206,6 +206,7 @@ mod tests {
         HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     };
 
+    use super::super::UpstreamBackend;
     use super::super::core::{PylonRetryConfig, build_response_headers};
 
     fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
@@ -243,8 +244,15 @@ mod tests {
         );
 
         let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
-        let headers = build_response_headers(status, &upstream_headers, &retry, None, "inst-a")
-            .expect("h3 success headers should build");
+        let headers = build_response_headers(
+            status,
+            &upstream_headers,
+            &retry,
+            UpstreamBackend::default(),
+            None,
+            "inst-a",
+        )
+        .expect("h3 success headers should build");
         let response = h3_response(status, headers).expect("h3 success response should build");
 
         assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);

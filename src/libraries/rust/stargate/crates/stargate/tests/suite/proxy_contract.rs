@@ -37,7 +37,7 @@ use pylon_lib::{
     CurrentModelStats, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
     PylonQueueMismatchRetryConfig, PylonRuntimeState, QuicHttpTunnelConfig, QuicHttpTunnelHandle,
     RequestObservation, RequestObservationEndpoint, RequestObservationState,
-    TunnelTransportProtocol, start_quic_http_tunnel,
+    TunnelTransportProtocol, UpstreamBackend, start_quic_http_tunnel,
 };
 use stargate::proxy::ProxyRetryConfig;
 use stargate::routing::RoutingTargetKey;
@@ -642,6 +642,7 @@ impl ProxyFixture {
         instance_id: &str,
         model: &str,
         queued_input_size: u64,
+        upstream_backend: UpstreamBackend,
         status: StatusCode,
         body: &'static str,
     ) -> CapturingChatBackend {
@@ -653,6 +654,7 @@ impl ProxyFixture {
             format!("http://{}", backend.addr),
         );
         tunnel_config.forwarding.runtime_state = runtime.clone();
+        tunnel_config.forwarding.upstream_backend = upstream_backend;
         let tunnel = start_quic_http_tunnel(tunnel_config)
             .await
             .expect("status backend tunnel failed to start");
@@ -3255,25 +3257,31 @@ const GENERIC_ERROR_BODY: &str = r#"{"error":"upstream failure"}"#;
 
 #[tokio::test]
 async fn backend_error_before_output_is_retried_on_an_untried_instance() {
-    // (label, status of the failing instance, its body, whether the healthy instance serves the request)
-    let cases: &[(&str, u16, &str, bool)] = &[
-        ("overloaded_529", 529, DYNAMO_OVERLOADED_BODY, true),
-        ("not_ready_503", 503, DYNAMO_NOT_READY_BODY, true),
-        ("worker_dead_500", 500, DYNAMO_SERVER_ERROR_BODY, true),
+    use UpstreamBackend::{Dynamo, Passthrough};
+    // (label, Pylon backend mode, status of the failing instance, its body,
+    // retry reason when the healthy instance serves the request)
+    #[rustfmt::skip] // one case per line
+    let cases: &[(&str, UpstreamBackend, u16, &str, Option<&str>)] = &[
+        ("overloaded_529", Dynamo, 529, DYNAMO_OVERLOADED_BODY, Some("upstream_overloaded")),
+        ("not_ready_503", Dynamo, 503, DYNAMO_NOT_READY_BODY, Some("upstream_unavailable")),
         // Dynamo's answer once the model has left its registry.
-        ("model_unregistered_404", 404, "", true),
-        ("model_not_found_404", 404, DYNAMO_NOT_FOUND_BODY, false),
-        ("bad_gateway_502", 502, GENERIC_ERROR_BODY, false),
-        ("gateway_timeout_504", 504, GENERIC_ERROR_BODY, false),
-        ("unsignalled_429", 429, GENERIC_ERROR_BODY, false),
+        ("model_unregistered_404", Dynamo, 404, "", Some("upstream_model_unregistered")),
+        // Only a Dynamo frontend gives the empty 404 that meaning.
+        ("passthrough_empty_404", Passthrough, 404, "", None),
+        ("model_not_found_404", Dynamo, 404, DYNAMO_NOT_FOUND_BODY, None),
+        // A 500 can come from the request itself.
+        ("server_error_500", Dynamo, 500, DYNAMO_SERVER_ERROR_BODY, None),
+        ("bad_gateway_502", Dynamo, 502, GENERIC_ERROR_BODY, None),
+        ("gateway_timeout_504", Dynamo, 504, GENERIC_ERROR_BODY, None),
+        ("unsignalled_429", Dynamo, 429, GENERIC_ERROR_BODY, None),
     ];
     let model = "backend-error-model";
-    for &(label, status, body, is_retried) in cases {
+    for &(label, upstream_backend, status, body, retry_reason) in cases {
         let status = StatusCode::from_u16(status).unwrap();
         let mut fixture = ProxyFixture::start(&format!("test-sg-backend-error-{label}")).await;
         // The failing instance looks idle, so it keeps attracting first attempts.
         let failing = fixture
-            .add_status_backend("inst-a", model, 0, status, body)
+            .add_status_backend("inst-a", model, 0, upstream_backend, status, body)
             .await;
         let healthy_runtime = active_runtime(model);
         set_model_queue(&healthy_runtime, model, 1);
@@ -3298,8 +3306,17 @@ async fn backend_error_before_output_is_retried_on_an_untried_instance() {
             failing.hits() > 0,
             "{label}: failing instance got no traffic"
         );
-        if is_retried {
+        if let Some(retry_reason) = retry_reason {
             assert!(failures.is_empty(), "{label}: client saw {failures:?}");
+            assert_eq!(
+                metric_sum_value(
+                    &fixture.metrics(),
+                    "stargate_proxy_retries_total",
+                    &[&format!(r#"reason="{retry_reason}""#)],
+                ),
+                failing.hits() as f64,
+                "{label}"
+            );
         } else {
             assert_eq!(failures.len(), failing.hits(), "{label}: {failures:?}");
             assert!(
@@ -3329,10 +3346,10 @@ async fn backend_errors_on_every_instance_stop_at_the_retry_limits() {
         // The request retry limit is 2.
         ("four_instances_529", &[529, 529, 529, 529], 3, true),
         ("single_instance_503", &[503], 1, false),
-        // A 500 is retried once, so a request that crashes the engine reaches two instances.
-        ("three_instances_500", &[500, 500, 500], 2, false),
+        // A 500 is not retried.
+        ("two_instances_500", &[500, 500], 1, false),
         // Not every instance was overloaded, so the last backend response is relayed.
-        ("mixed_500_and_529", &[500, 529], 2, false),
+        ("mixed_503_and_529", &[503, 529], 2, false),
     ];
     let model = "backend-error-model";
     for &(label, statuses, expected_tried, is_overload_response) in cases {
@@ -3345,6 +3362,7 @@ async fn backend_errors_on_every_instance_stop_at_the_retry_limits() {
                         &format!("inst-{index}"),
                         model,
                         0,
+                        UpstreamBackend::Dynamo,
                         StatusCode::from_u16(*status).unwrap(),
                         dynamo_error_body(*status),
                     )
