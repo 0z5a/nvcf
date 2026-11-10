@@ -80,7 +80,8 @@ def compare(before_file, render_dir):
         print(f"BACKWARD {name}: running {current}, the render pulls {planned}")
     if backward:
         print(f"{len(backward)} image(s) would move to an older version; stop and read "
-              "'Releases not covered yet' and Step 3", file=sys.stderr)
+              "'Releases not covered yet' and 'Self-Managed 1.0.9: keep the NATS images'",
+              file=sys.stderr)
         return 1
     print(f"No image moves to an older version ({compared} compared)")
     return 0
