@@ -781,6 +781,7 @@ func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, requ
 	if handled {
 		return
 	}
+	defer limitStreamedBodyIdle(writer, resolved.request)()
 
 	finishShadowPrimary := d.dispatchShadowIfNeeded(resolved, modelToNVCFUrl, endpoint)
 	var proxyErr error

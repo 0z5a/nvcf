@@ -25,9 +25,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/valyala/bytebufferpool"
 	"go.opentelemetry.io/otel"
@@ -49,6 +51,11 @@ import (
 // requestPrefixLimit bounds the bytes read and retained per request before the
 // gateway chooses between the streamed and buffered paths.
 const requestPrefixLimit = 64 << 10
+
+// streamedBodyIdleTimeout ends a streamed request whose client sends no body
+// bytes for this long after dispatch, so a stalled upload does not hold the
+// upstream request open. Tests shorten it.
+var streamedBodyIdleTimeout = 60 * time.Second
 
 // requestPrefixMinRead is the first read size when Content-Length is unknown.
 // The prefix buffer grows from there, so small bodies do not take 64 KiB.
@@ -467,16 +474,82 @@ func jsonValueEnd(buf []byte, start int) (int, int, bool) {
 // prefix is guarded. Reads from the client body are not guarded here; the
 // server body serializes them with Close, so Close waits for a read already in
 // progress to return.
+//
+// After dispatch, a timer bounds each wait for the client body, so a stalled
+// upload ends the upstream request. Only time spent waiting inside a read of
+// the client body counts; time the transport spends writing to a slow
+// upstream does not. When a read has waited idleTimeout, the timer sets a read
+// deadline in the past on the inbound connection, which ends that read. The
+// timer runs only while the handler runs, because the server's response
+// controller must not be used after the handler returns: the handler stops it
+// before returning.
 type prefixReplayBody struct {
 	mu     sync.Mutex
 	prefix *bytebufferpool.ByteBuffer
 	offset int
 	closed bool
 	rest   io.ReadCloser
+
+	// expire sets the inbound read deadline. It is nil when no idle limit
+	// applies or the limit has stopped.
+	expire       func(time.Time) error
+	idleTimeout  time.Duration
+	idleTimer    *time.Timer
+	waitingSince time.Time // start of the client body read in progress, if any
 }
 
 func newPrefixReplayBody(prefix *bytebufferpool.ByteBuffer, rest io.ReadCloser) *prefixReplayBody {
 	return &prefixReplayBody{prefix: prefix, rest: rest}
+}
+
+// limitStreamedBodyIdle bounds each wait for a streamed primary request body
+// by streamedBodyIdleTimeout. The returned function stops it and must run
+// before the handler returns.
+func limitStreamedBodyIdle(writer http.ResponseWriter, request *http.Request) func() {
+	body, ok := request.Body.(*prefixReplayBody)
+	if !ok || isShadowRequest(request) || streamedBodyIdleTimeout <= 0 {
+		return func() {}
+	}
+	body.mu.Lock()
+	defer body.mu.Unlock()
+	if body.closed {
+		return func() {}
+	}
+	body.expire = http.NewResponseController(writer).SetReadDeadline
+	body.idleTimeout = streamedBodyIdleTimeout
+	body.idleTimer = time.AfterFunc(body.idleTimeout, body.checkIdle)
+	return body.stopIdleLimit
+}
+
+// checkIdle ends a client body read that has waited idleTimeout, and
+// otherwise checks again when the read in progress, or a read that starts
+// now, would reach it.
+func (b *prefixReplayBody) checkIdle() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.expire == nil {
+		return
+	}
+	next := b.idleTimeout
+	if !b.waitingSince.IsZero() {
+		waited := time.Since(b.waitingSince)
+		if waited >= b.idleTimeout {
+			_ = b.expire(time.Unix(1, 0))
+			b.expire = nil
+			return
+		}
+		next -= waited
+	}
+	b.idleTimer.Reset(next)
+}
+
+func (b *prefixReplayBody) stopIdleLimit() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.expire = nil
+	if b.idleTimer != nil {
+		b.idleTimer.Stop()
+	}
 }
 
 func (b *prefixReplayBody) Read(p []byte) (int, error) {
@@ -494,12 +567,28 @@ func (b *prefixReplayBody) Read(p []byte) (int, error) {
 		b.mu.Unlock()
 		return n, nil
 	}
-	b.mu.Unlock()
-	n, err := b.rest.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		err = &clientBodyReadError{err: err}
+	if b.expire != nil {
+		b.waitingSince = time.Now()
 	}
-	return n, err
+	idle := b.idleTimeout
+	b.mu.Unlock()
+
+	n, err := b.rest.Read(p)
+	b.mu.Lock()
+	b.waitingSince = time.Time{}
+	b.mu.Unlock()
+	if err == nil {
+		return n, nil
+	}
+	// The upload ended or failed, so no later read needs the limit.
+	b.stopIdleLimit()
+	if errors.Is(err, io.EOF) {
+		return n, err
+	}
+	if idle > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+		err = fmt.Errorf("no request body bytes for %s: %w", idle, err)
+	}
+	return n, &clientBodyReadError{err: err}
 }
 
 // clientBodyReadError marks a failure to read the client upload after a

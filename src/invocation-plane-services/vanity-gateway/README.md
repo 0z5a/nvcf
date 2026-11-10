@@ -451,6 +451,7 @@ flowchart TD
   forwarded, and applies backpressure from the upstream to the client upload.
   The upstream request starts before the upload ends, so a slow upload holds
   the upstream connection for as long as the client takes to send the body.
+  An upload that sends no bytes for 60 seconds ends the request.
 
 A body longer than the prefix streams when its top-level JSON object has
 `model`, and outside the decision routes `stream`, within the prefix. Other
@@ -503,10 +504,10 @@ Failures after a streamed request is dispatched:
   error as a limit reached before dispatch: `400` on OpenAI routes and `413` on
   native routes. The upstream receives an incomplete body, never a complete
   truncated one.
-- If the client disconnects or the upload fails, the upstream request is
-  aborted with an incomplete body and the gateway records `client_canceled`
-  (`499`), not an upstream error. An upload that fails before dispatch still
-  returns `500`.
+- If the client disconnects, the upload fails, or the client sends no body
+  bytes for 60 seconds, the upstream request is aborted with an incomplete body
+  and the gateway records `client_canceled` (`499`), not an upstream error. An
+  upload that fails before dispatch still returns `500`.
 - If the upstream has already started its response, the failure ends that
   response.
 - If the upstream answers before reading the whole body, the client receives

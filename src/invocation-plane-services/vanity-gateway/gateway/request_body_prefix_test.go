@@ -545,7 +545,7 @@ func TestStreamedRequestOverRealTransport(t *testing.T) {
 	pr, pw := io.Pipe()
 	req, err := http.NewRequest(http.MethodPost, url+"/v1/chat/completions", pr)
 	require.NoError(t, err)
-	response := sendAsync(req)
+	response := sendAsync(http.DefaultClient, req)
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := io.WriteString(pw, head)
@@ -930,12 +930,12 @@ type clientResult struct {
 	err    error
 }
 
-// sendAsync sends req from another goroutine and delivers its status and
-// body after the response has been read and closed.
-func sendAsync(req *http.Request) <-chan clientResult {
+// sendAsync sends req with client from another goroutine and delivers its
+// status and body after the response has been read and closed.
+func sendAsync(client *http.Client, req *http.Request) <-chan clientResult {
 	result := make(chan clientResult, 1)
 	go func() {
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			result <- clientResult{err: err}
 			return
@@ -1015,7 +1015,7 @@ func TestStreamedRequestEarlyUpstreamResponse(t *testing.T) {
 	defer pw.Close()
 
 	select {
-	case got := <-sendAsync(req):
+	case got := <-sendAsync(http.DefaultClient, req):
 		require.NoError(t, got.err, "client request failed")
 		assert.Equal(t, http.StatusUnauthorized, got.status)
 		assert.Contains(t, got.body, "bdd-early-reject")
