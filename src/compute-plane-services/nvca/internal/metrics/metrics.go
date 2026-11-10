@@ -29,13 +29,13 @@ import (
 	promdto "github.com/prometheus/client_model/go"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
-	translatecommon "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	translatecommon "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 
-	ictx "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/context"
-	modelcachetypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/modelcachetypes"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/workloadtypes"
-	nvcaerrors "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/errors"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	ictx "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/context"
+	modelcachetypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/modelcachetypes"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/workloadtypes"
+	nvcaerrors "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/errors"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 const (
@@ -81,6 +81,9 @@ const (
 	// Cluster attribute metrics
 	KataRuntimeIsolationEnabledMetricName = "nvca_kata_runtime_isolation_enabled"
 	MaintenanceModeStateMetricName        = "nvca_maintenance_mode_state"
+
+	// BYOO metrics
+	BYOOPlatformMetricsFederationStateMetricName = "nvca_byoo_platform_metrics_federation_state"
 
 	// Cluster-validator metrics — populated by a SharedInformer that
 	// watches the cluster-validator-summary ConfigMap. The dynamic-cardinality
@@ -170,6 +173,9 @@ const (
 
 	// Maintenance-mode label
 	MaintenanceModeLabel = "mode"
+
+	// BYOO platform metrics federation check label
+	BYOOPlatformMetricsFederationStateLabel = "state"
 
 	// UpstreamOperation values for use with RecordUpstreamRequest.
 	UpstreamOperationHeartbeat   = "heartbeat"
@@ -304,6 +310,11 @@ type Metrics struct {
 	// the update protocol.
 	MaintenanceModeState *prometheus.GaugeVec
 
+	// BYOOPlatformMetricsFederationState reports the latest result of the
+	// BYOO platform metrics federation target check (one-hot encoding). See
+	// SetBYOOPlatformMetricsFederationState().
+	BYOOPlatformMetricsFederationState *prometheus.GaugeVec
+
 	// Cluster-validator metrics — see SetClusterValidatorSummary() for the
 	// update protocol. The dynamic-cardinality vectors (Endpoint, NetpolPair)
 	// are prune-on-update so only the current run's label values are
@@ -382,6 +393,7 @@ func (m *Metrics) Destroy() {
 	prometheus.Unregister(m.ModelCacheReclaimedTotal)
 	prometheus.Unregister(m.KataRuntimeIsolationEnabled)
 	prometheus.Unregister(m.MaintenanceModeState)
+	prometheus.Unregister(m.BYOOPlatformMetricsFederationState)
 	prometheus.Unregister(m.ClusterValidatorReady)
 	prometheus.Unregister(m.ClusterValidatorCheckStatus)
 	prometheus.Unregister(m.ClusterValidatorEndpointReachable)
@@ -774,6 +786,16 @@ func NewDefaultMetrics(ncaID, clusterName, clusterGroup, version string, opts ..
 	for _, mode := range types.AllMaintenanceModes {
 		m.MaintenanceModeState.WithLabelValues(m.WithDefaultLabelValues(mode.String())...).Set(0)
 	}
+
+	m.BYOOPlatformMetricsFederationState = promFactory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: BYOOPlatformMetricsFederationStateMetricName,
+		Help: "Latest result of NVCA's check of the configured BYOO platform metrics federation " +
+			"target. The series whose state label matches the result is 1 and every other state " +
+			"series is 0 (one-hot encoding). state is one of not_checked, reachable, unreachable. " +
+			"not_checked means BYOObservability is off, federation is disabled, or no target is set.",
+	}, withDefaultLabels(BYOOPlatformMetricsFederationStateLabel))
+	// Every series appears on the first Prometheus scrape, starting at not_checked.
+	m.SetBYOOPlatformMetricsFederationState(BYOOPlatformMetricsFederationNotChecked)
 
 	// Cluster-validator metrics. Fixed-cardinality vectors (Ready,
 	// LastRun*, CheckStatus per known check) are initialized to zero so
@@ -1205,6 +1227,44 @@ func (m *Metrics) SetMaintenanceModeState(mode types.MaintenanceMode) {
 			val = 1.0
 		}
 		m.MaintenanceModeState.WithLabelValues(m.WithDefaultLabelValues(mm.String())...).Set(val)
+	}
+}
+
+// BYOOPlatformMetricsFederationState is the result of NVCA's check of the
+// configured BYOO platform metrics federation target.
+type BYOOPlatformMetricsFederationState string
+
+const (
+	// BYOOPlatformMetricsFederationNotChecked means NVCA does not check a
+	// target: BYOObservability is off, federation is disabled, or no target is set.
+	BYOOPlatformMetricsFederationNotChecked BYOOPlatformMetricsFederationState = "not_checked"
+	// BYOOPlatformMetricsFederationReachable means the target answered /federate.
+	BYOOPlatformMetricsFederationReachable BYOOPlatformMetricsFederationState = "reachable"
+	// BYOOPlatformMetricsFederationUnreachable means the target did not answer /federate successfully.
+	BYOOPlatformMetricsFederationUnreachable BYOOPlatformMetricsFederationState = "unreachable"
+)
+
+// AllBYOOPlatformMetricsFederationStates lists every federation check state,
+// used to initialize every series of the state gauge.
+var AllBYOOPlatformMetricsFederationStates = []BYOOPlatformMetricsFederationState{
+	BYOOPlatformMetricsFederationNotChecked,
+	BYOOPlatformMetricsFederationReachable,
+	BYOOPlatformMetricsFederationUnreachable,
+}
+
+// SetBYOOPlatformMetricsFederationState updates the federation check gauge:
+// the series for the given state is set to 1 and every other known state is
+// set to 0 (one-hot encoding). Safe to call repeatedly and on a nil receiver.
+func (m *Metrics) SetBYOOPlatformMetricsFederationState(state BYOOPlatformMetricsFederationState) {
+	if m == nil || m.BYOOPlatformMetricsFederationState == nil {
+		return
+	}
+	for _, s := range AllBYOOPlatformMetricsFederationStates {
+		val := 0.0
+		if s == state {
+			val = 1.0
+		}
+		m.BYOOPlatformMetricsFederationState.WithLabelValues(m.WithDefaultLabelValues(string(s))...).Set(val)
 	}
 }
 

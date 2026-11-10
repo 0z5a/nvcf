@@ -51,6 +51,11 @@ const statusClientClosedRequest = 499
 func writeFunctionStatusError(writer http.ResponseWriter, request *http.Request, offlineMessage string, eol time.Time, name string) bool {
 	if offlineMessage != "" {
 		markGatewayRejected(writer, request)
+		if requestProtocol(request) != nativeProtocolNone {
+			writer.Header().Set("Retry-After", "10800")
+			writeNativeError(writer, request, http.StatusServiceUnavailable, "", offlineMessage)
+			return true
+		}
 		writer.Header().Set("Content-Type", "application/problem+json")
 		writer.Header().Set("Retry-After", "10800")
 		writer.WriteHeader(http.StatusServiceUnavailable)
@@ -63,6 +68,11 @@ func writeFunctionStatusError(writer http.ResponseWriter, request *http.Request,
 		return true
 	}
 	if isModelExpired(eol) {
+		if requestProtocol(request) != nativeProtocolNone {
+			markGatewayRejected(writer, request)
+			writeNativeError(writer, request, http.StatusGone, "", "model has reached end of life")
+			return true
+		}
 		var detail string
 		if name != "" {
 			detail = fmt.Sprintf("The model '%s' has reached its end of life on %s and is no longer available.", name, eol.Format(time.RFC3339))
@@ -123,6 +133,7 @@ func markUpstreamResponse(request *http.Request, resp *http.Response) {
 func requestProxy(base *httputil.ReverseProxy, request *http.Request, proxyErr *error) *httputil.ReverseProxy {
 	rp := *base
 	rp.ModifyResponse = func(resp *http.Response) error {
+		middleware.DropUpstreamRequestIDHeaders(request.Context(), resp.Header)
 		markUpstreamResponse(request, resp)
 		return modifyTooManyRequestsResponse(resp)
 	}
@@ -145,8 +156,7 @@ func writeProxyError(writer http.ResponseWriter, request *http.Request, err erro
 			zap.String(string(middleware.GatewayProxyOutcomeMetricAttribute), string(middleware.GatewayProxyOutcomeClientCanceled)),
 			zap.Error(err),
 		)
-		if request.URL.Path == "/v1/messages" {
-			writeAnthropicError(writer, statusClientClosedRequest, "client closed the request")
+		if writeProtocolError(writer, proxyErrorProtocol(request), statusClientClosedRequest, "", "client closed the request") {
 			return
 		}
 		writer.Header().Set("Content-Type", "application/problem+json")
@@ -169,8 +179,7 @@ func writeBadGatewayProblem(writer http.ResponseWriter, request *http.Request, e
 		zap.String(string(middleware.GatewayProxyOutcomeMetricAttribute), string(middleware.GatewayProxyOutcomeProxyError)),
 		zap.Error(err),
 	)
-	if request.URL.Path == "/v1/messages" {
-		writeAnthropicError(writer, http.StatusBadGateway, "upstream request failed")
+	if writeProtocolError(writer, proxyErrorProtocol(request), http.StatusBadGateway, "", "upstream request failed") {
 		return
 	}
 	writer.Header().Set("Content-Type", "application/problem+json")
@@ -304,7 +313,24 @@ func applyExecTarget(request *http.Request, apiScheme string, apiHost string, ta
 	}
 	request.Host = ""
 	setPollingHeaderIfNotPresent(request, target.sessionTimeout)
+	stripCallerCredentials(request)
 	applyCustomHeaders(request, target.customHeaders)
+}
+
+// callerCredentialHeaders are caller credentials the invocation service would
+// pass on to the function. Authorization is not listed: the invocation service
+// authenticates the request with it and removes it before the function. LLM
+// Gateway routes keep these headers because the LLM Gateway authenticates
+// Messages callers with X-Api-Key.
+var callerCredentialHeaders = []string{
+	"X-Api-Key",
+	"Cookie",
+}
+
+func stripCallerCredentials(request *http.Request) {
+	for _, name := range callerCredentialHeaders {
+		request.Header.Del(name)
+	}
 }
 
 func applyCustomHeaders(request *http.Request, headers config.CustomHeaders) {
@@ -348,6 +374,7 @@ func (d *VanityDirector) ServePolling(writer http.ResponseWriter, request *http.
 	request.URL = nvcfUrl
 	request.Host = ""
 	setPollingHeaderIfNotPresent(request, 0)
+	request = request.WithContext(middleware.ContextWithCallKind(request.Context(), middleware.CallKindPoll))
 
 	requestProxy(d.rp, request, nil).ServeHTTP(writer, request)
 }

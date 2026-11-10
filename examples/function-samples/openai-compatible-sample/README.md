@@ -15,6 +15,8 @@ clients.
 | `POST /v1/responses` | Responses API JSON or SSE output |
 | `POST /v1/embeddings` | Embeddings for one string or an array of strings |
 | `POST /v1/messages` | Anthropic Messages JSON or SSE output |
+| `POST /v1/decisions` | Canned Decisions answers, one per question, in order |
+| `POST /v1/systemone` | Canned System One answers, keyed by question name |
 | `GET /v1/models` | Lists the sample model |
 | `GET /v1/models/{id}` | Returns metadata for a model ID |
 | `GET /health` | Health check returning 200 |
@@ -34,24 +36,25 @@ decoded normally.
 
 If any request header starts with `X-Load-Tester-`, all body controls are
 ignored. Header controls and defaults apply instead. The default output chunk
-is `xxxx`. Text controls apply to Chat Completions, Responses, Messages, and
+is `xxxx` unless the container sets `LOAD_TESTER_DEFAULT_CHUNK`. Text controls apply to Chat Completions, Responses, Messages, and
 legacy Completions. Queue delay, TTFT, status injection, and concurrency limits apply
 to all POST routes.
 
 | Control | Header | JSON body field | Default | Behavior |
 |---------|--------|-----------------|---------|----------|
 | Queue delay | `X-Load-Tester-Queue-Delay-Ms` | `x_load_tester_queue_delay_ms` | `0` | Delay before processing the request. |
-| TTFT | `X-Load-Tester-TTFT-Ms` | `x_load_tester_ttft_ms` | `0` | Delay before the first response byte. |
+| TTFT | `X-Load-Tester-TTFT-Ms` | `x_load_tester_ttft_ms` | `LOAD_TESTER_DEFAULT_TTFT_MS`, else `0` | Delay before the first response byte. |
 | TTFT jitter | `X-Load-Tester-TTFT-Jitter-Ms` | `x_load_tester_ttft_jitter_ms` | `0` | Random extra delay from 0 through this value. |
-| ITL | `X-Load-Tester-ITL-Ms` | `x_load_tester_itl_ms` | `0` | Delay between streamed output chunks. |
+| ITL | `X-Load-Tester-ITL-Ms` | `x_load_tester_itl_ms` | `LOAD_TESTER_DEFAULT_ITL_MS`, else `0` | Delay between streamed output chunks. |
 | ITL jitter | `X-Load-Tester-ITL-Jitter-Ms` | `x_load_tester_itl_jitter_ms` | `0` | Random extra delay between chunks. |
-| Chunk text | `X-Load-Tester-Chunk` | `x_load_tester_chunk` | `xxxx` | Text returned in each output chunk. |
+| Chunk text | `X-Load-Tester-Chunk` | `x_load_tester_chunk` | `LOAD_TESTER_DEFAULT_CHUNK`, else `xxxx` | Text returned in each output chunk. |
 | Chunk bytes | `X-Load-Tester-Chunk-Bytes` | `x_load_tester_chunk_bytes` | `0` | Generate a random chunk of this byte length. |
 | Output chunks | `X-Load-Tester-Output-Chunks` | `x_load_tester_output_chunks` | `1` | Number of text chunks to return, capped by the startup limit. |
 | Status injection | `X-Load-Tester-Status-Code` | `x_load_tester_status_code` | unset | Return an OpenAI-shaped HTTP error. |
 | Stream error | `X-Load-Tester-Stream-Error-After-Chunks` | `x_load_tester_stream_error_after_chunks` | unset | End a stream with an OpenAI-shaped error after this many chunks. |
 | Stream truncate | `X-Load-Tester-Stream-Truncate-After-Chunks` | `x_load_tester_stream_truncate_after_chunks` | unset | Close a stream without its completion event after this many chunks. |
 | Concurrency limit | `X-Load-Tester-Max-Concurrency` | `x_load_tester_max_concurrency` | `0` | Return 429 when the global in-flight request count exceeds this value. |
+| Echo | `X-Load-Tester-Echo` | `x_load_tester_echo` | `false` | Return the raw request body as the output text. |
 
 Timing values are non-negative integer milliseconds and are capped at five
 minutes. Output is capped at 1 MiB and the startup chunk limit. The
@@ -61,6 +64,51 @@ accepts values from 1 through 60000. It is read once when the server starts.
 are mutually exclusive.
 For a deterministic concurrency test, send the same concurrency limit header
 on every request in the load test.
+
+## Container defaults
+
+Three environment variables set defaults for one container. A request that
+sets the matching control, by header or body field, still overrides them.
+
+| Environment variable | Control | Accepted values |
+|----------------------|---------|-----------------|
+| `LOAD_TESTER_DEFAULT_TTFT_MS` | TTFT | Integer milliseconds from 0 through 300000 |
+| `LOAD_TESTER_DEFAULT_ITL_MS` | ITL | Integer milliseconds from 0 through 300000 |
+| `LOAD_TESTER_DEFAULT_CHUNK` | Chunk text | Text of at most 1 MiB |
+
+The server reads them once at startup and exits with an error on an invalid
+value. An empty value counts as unset. The `Chunk-Bytes` and echo controls
+replace the default chunk text.
+
+Use them when a request cannot choose the container that serves it. For
+example, give two versions of one NVCF LLM function different defaults through
+each version's container environment. The request router picks the version,
+so only a container default can make one version slower. A distinct default
+chunk for each version, such as `fast` and `slow`, shows in every response
+which version answered.
+
+## Echo control
+
+Set `x_load_tester_echo` to `true`, or send `X-Load-Tester-Echo: true`, to
+return the request body exactly as the sample received it. Use it to check that
+a gateway forwards request fields without adding, dropping, or rewriting them.
+
+Echo applies to Chat Completions and Responses, streaming and non-streaming.
+The output text is the raw body, so parse it as JSON and compare fields. A body
+control is part of the echoed body. Echo cannot be combined with `Chunk`,
+`Chunk-Bytes`, or `Output-Chunks`, and the 1 MiB output cap applies. Other
+routes reject the control with 400.
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "model": "test-model",
+    "messages": [{"role": "user", "content": "hello"}],
+    "chat_template_kwargs": {"enable_thinking": false},
+    "x_load_tester_echo": true
+  }' | jq -r '.choices[0].message.content | fromjson'
+```
 
 ## Anthropic Messages
 
@@ -105,6 +153,15 @@ prompt caching, token counting, and Message Batches are not implemented.
 cd examples/function-samples/openai-compatible-sample
 docker build --platform linux/amd64 -t openai-compatible-sample .
 docker run --rm -p 18000:8000 openai-compatible-sample
+```
+
+Release images are built with Bazel for linux/amd64 and linux/arm64. A
+`feat`, `fix`, or `perf` commit under this directory cuts an
+`examples/function-samples/openai-compatible-sample/vX.Y.Z` release, and the
+release pipeline publishes that version. Build the same image locally with:
+
+```bash
+bazel build //examples/function-samples/openai-compatible-sample/http-server:image_index
 ```
 
 ## Smoke test
@@ -288,6 +345,34 @@ ulimit -n 65536
   -e LOAD_TESTER_OUTPUT_CHUNKS=12000
 ```
 
+## Decision routes
+
+`POST /v1/decisions` and `POST /v1/systemone` return fixed answers for test
+use. Decisions returns `answers` as a list in question order. System One
+returns `answers` keyed by question name. Both include `model` and `usage`.
+Benchmark controls do not apply. Only `X-Load-Tester-Echo` and the
+`x_load_tester_echo` body field are read, and they add the request body as
+`request_body`.
+
+Every successful response has an `echo` object with the request headers
+`typesafe-danger-zone-images`, `x-model`, `x-input-tokens`, `x-request-id`
+and `x-vendor-test` when present, plus `body_length` and
+`credentials_received`. `credentials_received` is `true` when the request
+carried `Authorization`, `X-Api-Key`, `Proxy-Authorization` or `Cookie`. The
+values are never echoed. When `TypeSafe-Danger-Zone-Images` is sent, a
+successful response also sets `x-mock-echo-typesafe-danger-zone-images`.
+When `X-Input-Tokens` is a non-negative integer, `usage.input_tokens` mirrors
+it. Otherwise the sample estimates one token per four body bytes.
+
+These two routes accept bodies up to 16 MiB. The other routes keep 10 MiB.
+Bodies must be one JSON object, otherwise the response is 400 with a JSON
+error. A `null` body is a 400, and so is a `model` that is not a string,
+including `null`. More than 1000 questions is a 400.
+When `X-Input-Tokens` is too large to add the output token to, the sample
+uses its own estimate. Add `?mock_error=429` for a 429 with `Retry-After: 7`, or
+`?mock_error=400` for a 400. The 400 body is FastAPI style
+(`{"detail":[...]}`) on System One and OpenAI style on Decisions.
+
 ## NVCF LLM functions
 
 Expose port 8000 and configure the function inference URL as `/`. Declare the
@@ -299,7 +384,9 @@ routes required by the workload, such as:
 /v1/responses
 /v1/embeddings
 /v1/messages
+/v1/decisions
+/v1/systemone
 ```
 
-See the [LLM Gateway guide](../../../docs/user/llm-gateway.md) for function
+See the [LLM Gateway guide](../../../docs/overview/llm-gateway.md) for function
 model configuration and invocation flow.

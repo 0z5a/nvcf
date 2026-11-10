@@ -1651,17 +1651,19 @@ func TestGatewayConfigValidateRejectsInvalidOrderedShadowSamplingMethods(t *test
 
 func TestGatewayConfigValidateScopesRequestBodyShadowSampling(t *testing.T) {
 	methods := samplingMethods(ShadowSamplingMethodPromptCacheKey, ShadowSamplingMethodFirstMessageHash)
-	for _, section := range []string{"chatCompletions", "responses"} {
+	for _, section := range []string{"chatCompletions", "responses", "anthropicMessages"} {
 		t.Run("accepts "+section, func(t *testing.T) {
 			require.NoError(t, gatewayConfigWithShadow(section, methods, nil, true).Validate())
 			require.NoError(t, gatewayConfigWithShadow(section, methods, nil, false).Validate())
+			require.NoError(t, gatewayConfigWithShadow(section, methods, []string{"X-Session-ID"}, true).Validate())
 		})
 	}
 	for section, location := range map[string]string{
 		"completions":       "openai.completions",
 		"embeddings":        "openai.embeddings",
 		"imageGenerations":  "openai.imageGenerations",
-		"anthropicMessages": "anthropicMessages",
+		"decisions":         "openai.decisions",
+		"typesafeSystemOne": "typesafeSystemOne",
 	} {
 		for _, perTarget := range []bool{false, true} {
 			form := "legacy"
@@ -1680,6 +1682,28 @@ func TestGatewayConfigValidateScopesRequestBodyShadowSampling(t *testing.T) {
 			assert.ErrorContains(t, err, "promptCacheKeyHeaders is unsupported for "+location)
 		})
 	}
+}
+
+func TestEffectivePromptCacheKeyHeadersDefaultsBySection(t *testing.T) {
+	tests := []struct {
+		name    string
+		section string
+		headers []string
+		want    []string
+	}{
+		{name: "chat default", section: "openai.chatCompletions", want: []string{DefaultPromptCacheKeyHeader}},
+		{name: "responses default", section: "openai.responses", want: []string{DefaultPromptCacheKeyHeader}},
+		{name: "messages default adds Claude Code session", section: "anthropicMessages", want: []string{DefaultPromptCacheKeyHeader, ClaudeCodeSessionIDHeader}},
+		{name: "messages explicit list", section: "anthropicMessages", headers: []string{"X-Session-ID"}, want: []string{"X-Session-ID"}},
+		{name: "messages empty list disables lookup", section: "anthropicMessages", headers: []string{}, want: []string{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ModelFunctionDetails{PromptCacheKeyHeaders: tc.headers}.EffectivePromptCacheKeyHeadersForSection(tc.section)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+	assert.Equal(t, "x-claude-code-session-id", ClaudeCodeSessionIDHeader)
 }
 
 func TestGatewayConfigValidatePromptCacheKeyHeaders(t *testing.T) {
@@ -1775,6 +1799,10 @@ func gatewayConfigWithShadow(
 		cfg.OpenAI.ImageGenerations = entries
 	case "anthropicMessages":
 		cfg.AnthropicMessages = entries
+	case "decisions":
+		cfg.OpenAI.Decisions = entries
+	case "typesafeSystemOne":
+		cfg.TypeSafeSystemOne = entries
 	}
 	return cfg
 }
@@ -1796,6 +1824,10 @@ func llmModelConfig(section string, entry ModelFunctionDetails) *GatewayConfig {
 		cfg.OpenAI.Completions = entries
 	case "imageGenerations":
 		cfg.OpenAI.ImageGenerations = entries
+	case "decisions":
+		cfg.OpenAI.Decisions = entries
+	case "typesafeSystemOne":
+		cfg.TypeSafeSystemOne = entries
 	}
 	return cfg
 }
@@ -1956,4 +1988,73 @@ func TestAnthropicMessagesConfigNamespace(t *testing.T) {
 	entry.ModelName = ""
 	cfg.AnthropicMessages["native"] = entry
 	require.ErrorContains(t, cfg.Validate(), "anthropicMessages.native: modelName is required")
+}
+
+func TestDecisionSectionsAcceptRandomAndPerBearerKeySampling(t *testing.T) {
+	methods := samplingMethods(ShadowSamplingMethodPerBearerKey, ShadowSamplingMethodRandom)
+	for _, section := range []string{"decisions", "typesafeSystemOne"} {
+		t.Run(section, func(t *testing.T) {
+			require.NoError(t, gatewayConfigWithShadow(section, methods, nil, true).Validate())
+		})
+	}
+}
+
+func TestDecisionConfigNamespaces(t *testing.T) {
+	var cfg GatewayConfig
+	require.NoError(t, json.Unmarshal([]byte(`{
+  "v2config": {
+   "openai": {"host": "api.example.com", "decisions": {
+    "dec": {"modelName": "dec-model", "functionID": "dec-function", "modelInfoFields": {"family": "decision"}}
+   }},
+   "typesafeSystemOne": {
+    "s1": {"modelName": "s1-model", "functionID": "s1-function", "functionType": "LLM"}
+   }
+  }
+ }`), &cfg))
+	require.NoError(t, cfg.Validate())
+	require.True(t, cfg.HasLLMGatewayRoute())
+	require.Equal(t, "dec-model", cfg.OpenAI.Decisions["dec"].ModelName)
+	require.Equal(t, "s1-model", cfg.TypeSafeSystemOne["s1"].ModelName)
+	// Shadow targets must stay inside the same section.
+	entry := cfg.TypeSafeSystemOne["s1"]
+	entry.ShadowModelName = "dec-model"
+	cfg.TypeSafeSystemOne["s1"] = entry
+	require.ErrorContains(t, cfg.Validate(), "typesafeSystemOne.s1: shadow target must reference another model in typesafeSystemOne")
+}
+
+func TestDecisionSectionsRejectLLMOnlyFieldsWithUsePexec(t *testing.T) {
+	for _, section := range []string{"decisions", "typesafeSystemOne"} {
+		t.Run(section, func(t *testing.T) {
+			entry := llmModel()
+			entry.UsePexec = true
+			require.ErrorContains(t, llmModelConfig(section, entry).Validate(), "usePexec is unsupported")
+		})
+	}
+}
+
+func TestDecisionSectionsRejectDuplicateModelNames(t *testing.T) {
+	for _, section := range []struct{ name, json string }{
+		{"openai.decisions", `{"openai": {"host": "api.example.com", "decisions": {
+			"a": {"modelName": "dec-model", "functionID": "f1"},
+			"b": {"modelName": "dec-model", "functionID": "f2"}}}}`},
+		{"typesafeSystemOne", `{"openai": {"host": "api.example.com"}, "typesafeSystemOne": {
+			"a": {"modelName": "s1-model", "functionID": "f1"},
+			"b": {"modelName": "s1-model", "functionID": "f2"}}}`},
+	} {
+		t.Run(section.name, func(t *testing.T) {
+			var cfg GatewayConfig
+			require.NoError(t, json.Unmarshal([]byte(`{"v2config": `+section.json+`}`), &cfg))
+			require.ErrorContains(t, cfg.Validate(), section.name+`: modelName "`)
+		})
+	}
+}
+
+func TestDecisionSectionsRejectTooManyRequestsMessage(t *testing.T) {
+	for _, section := range []string{"decisions", "typesafeSystemOne"} {
+		t.Run(section, func(t *testing.T) {
+			entry := llmModel()
+			entry.TooManyRequestsMessage = "Try again later."
+			require.ErrorContains(t, llmModelConfig(section, entry).Validate(), "tooManyRequestsMessage is unsupported")
+		})
+	}
 }

@@ -26,7 +26,7 @@ llmApiGateway:
   image:
     registry: ""
     repository: ""
-    tag: "0.14.8"
+    tag: "0.21.2"
     pullPolicy: IfNotPresent
 
   imagePullSecrets: []
@@ -70,6 +70,13 @@ llmApiGateway:
     # reading. Applies only while a write is in progress, so it does not cap
     # total response time or upstream pauses. 0s disables the bound.
     inferenceWriteTimeout: 60s
+    # Flat input token estimate for each image on /v1/decisions and
+    # /v1/systemone. The image payload is never counted by size. Must be 0 or
+    # more; 0 counts images as free.
+    decisionImageTokens: 1024
+    # Request bodies larger than this get 413 and are never forwarded. Must be
+    # a whole number of bytes, 0 or more; 0 disables the limit.
+    maxRequestBodyBytes: 52428800
     nvcfGrpcAddr: "api.nvcf.svc.cluster.local:9090"
     nvcfGrpcInsecure: false
     nvcfGrpcTimeout: 2s
@@ -79,6 +86,10 @@ llmApiGateway:
     defaultModel: ""
     defaultRpm: 120
     defaultTpm: 240000
+    # Put the LLM Request Router rejection reason, such as
+    # no_eligible_candidates, in error.code of OpenAI-format error responses.
+    # When false, the reason is only logged.
+    exposeRouterErrorCodes: false
     # Session last-cluster hint (x-stargate-last-cluster-id) for the LLM
     # Request Router. Stored in Olric when olric.enabled is true, otherwise in
     # a per-pod LRU capped at localMaxEntries. Enable it after the router is

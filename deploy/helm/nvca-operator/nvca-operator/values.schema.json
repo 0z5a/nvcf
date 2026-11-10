@@ -61,13 +61,12 @@
                 },
                 "imageRepository": {
                     "type": "string",
-                    "description": "(OPTIONAL) Image repository of OpenTelemetry Collector sidecar. If not specified, it will be calculated based on image.repository (stg vs prod).",
+                    "description": "(OPTIONAL) Image repository of OpenTelemetry Collector sidecar. If not specified, it is nvcf-otel-collector under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).",
                     "default": ""
                 },
                 "imageTag": {
                     "type": "string",
-                    "description": "Image tag of OpenTelemetry Collector sidecar.",
-                    "default": "0.160.0-nv-0.2.5"
+                    "description": "Image tag of OpenTelemetry Collector sidecar."
                 },
                 "resources": {
                     "type": "object",
@@ -224,7 +223,7 @@
         },
         "clusterGroupID": {
             "type": "string",
-            "description": "Group ID of the Cluster for this NVCA instance to manage (REQUIRED when ngcConfig.clusterSource is \"self-managed\"; for \"helm-managed\" prefer helmManaged.clusterGroupID — this top-level value is used as a fallback if helmManaged.clusterGroupID is unset)",
+            "description": "Group ID of the Cluster for this NVCA instance to manage (REQUIRED when ngcConfig.clusterSource is \"self-managed\"; for \"helm-managed\" prefer helmManaged.clusterGroupID; this top-level value is used as a fallback if helmManaged.clusterGroupID is unset)",
             "default": ""
         },
         "clusterName": {
@@ -313,7 +312,38 @@
                 },
                 "otelCollector": {
                     "type": "object",
-                    "description": "Structured BYOO OTel collector rendering overrides."
+                    "description": "Structured BYOO OTel collector rendering overrides.",
+                    "properties": {
+                        "platformMetricsFederation": {
+                            "type": "object",
+                            "description": "Platform metrics federation scrape. Self-managed clusters disable it unless enabled or target is set.",
+                            "additionalProperties": false,
+                            "properties": {
+                                "enabled": {
+                                    "type": "boolean",
+                                    "description": "Render the federation scrape jobs. Unset keeps the cluster default."
+                                },
+                                "target": {
+                                    "type": "string",
+                                    "description": "host:port of a Prometheus-compatible server that serves /federate.",
+                                    "anyOf": [
+                                        {
+                                            "description": "DNS name or IPv4 address, then a port.",
+                                            "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*:[0-9]{1,5}$"
+                                        },
+                                        {
+                                            "description": "Bracketed IPv6 address that net.ParseIP accepts, then a port.",
+                                            "pattern": "^\\[((([0-9A-Fa-f]{1,4}:){6}|::([0-9A-Fa-f]{1,4}:){5}|([0-9A-Fa-f]{1,4})?::([0-9A-Fa-f]{1,4}:){4}|(([0-9A-Fa-f]{1,4}:)?[0-9A-Fa-f]{1,4})?::([0-9A-Fa-f]{1,4}:){3}|(([0-9A-Fa-f]{1,4}:){0,2}[0-9A-Fa-f]{1,4})?::([0-9A-Fa-f]{1,4}:){2}|(([0-9A-Fa-f]{1,4}:){0,3}[0-9A-Fa-f]{1,4})?::[0-9A-Fa-f]{1,4}:|(([0-9A-Fa-f]{1,4}:){0,4}[0-9A-Fa-f]{1,4})?::)([0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}|(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))|(([0-9A-Fa-f]{1,4}:){0,5}[0-9A-Fa-f]{1,4})?::[0-9A-Fa-f]{1,4}|(([0-9A-Fa-f]{1,4}:){0,6}[0-9A-Fa-f]{1,4})?::)\\]:[0-9]{1,5}$"
+                                        }
+                                    ],
+                                    "not": {
+                                        "description": "Reject ports outside 1 through 65535.",
+                                        "pattern": ":(0+|655(3[6-9]|[4-9][0-9])|65[6-9][0-9]{2}|6[6-9][0-9]{3}|[7-9][0-9]{4})$"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
                 "additionalResourceOverhead": {
                     "type": "object",
@@ -756,8 +786,23 @@
                         },
                         "imageTag": {
                             "type": "string",
-                            "description": "BYOO OpenTelemetry Collector image tag.",
-                            "default": "0.160.0-nv-0.2.5"
+                            "description": "BYOO OpenTelemetry Collector image tag."
+                        }
+                    }
+                },
+                "byooFluentBit": {
+                    "type": "object",
+                    "description": "Optional BYOO Fluent Bit image. When imageRepository is set, the chart passes BYOO_FLUENTBIT_CONTAINER to function and task workloads.",
+                    "properties": {
+                        "imageRepository": {
+                            "type": "string",
+                            "description": "Optional BYOO Fluent Bit image repository, including the registry. If unset, NVCA uses its built-in upstream Fluent Bit image.",
+                            "default": ""
+                        },
+                        "imageTag": {
+                            "type": "string",
+                            "description": "BYOO Fluent Bit image tag. Required when imageRepository is set.",
+                            "default": ""
                         }
                     }
                 },
@@ -1041,13 +1086,13 @@
                     "properties": {
                         "imageRepository": {
                             "type": "string",
-                            "description": "(OPTIONAL) Image repository of \"nvcf-image-credential-helper\". Only override this if you know what you are doing. If not specified, it will be calculated based on image.repository.",
+                            "description": "(OPTIONAL) Image repository of \"nvcf-image-credential-helper\". Only override this if you know what you are doing. If not specified, it is nvcf-image-credential-helper under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).",
                             "default": ""
                         },
                         "imageTag": {
                             "type": "string",
                             "description": "(REQUIRED) Image tag of \"nvcf-image-credential-helper\". Only override this if you know what you are doing.",
-                            "default": "0.11.1"
+                            "default": "0.11.4"
                         }
                     }
                 },
@@ -1061,13 +1106,12 @@
                         },
                         "imageRepository": {
                             "type": "string",
-                            "description": "(OPTIONAL) Image repository of \"otel-collector\". Only override this if you know what you are doing. If not specified, it will be calculated based on image.repository.",
+                            "description": "(OPTIONAL) Image repository of \"otel-collector\". Only override this if you know what you are doing. If not specified, it is nvcf-otel-collector under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).",
                             "default": ""
                         },
                         "imageTag": {
                             "type": "string",
-                            "description": "(REQUIRED) Image tag of \"otel-collector\". Only override this if you know what you are doing.",
-                            "default": "0.160.0-nv-0.2.5"
+                            "description": "(REQUIRED) Image tag of \"otel-collector\". Only override this if you know what you are doing."
                         }
                     }
                 }
@@ -1112,13 +1156,13 @@
                     "properties": {
                         "imageRepository": {
                             "type": "string",
-                            "description": "(OPTIONAL) Image repository of \"nvcf-image-credential-helper\". Only override this if you know what you are doing. If not specified, it will be calculated based on image.repository.",
+                            "description": "(OPTIONAL) Image repository of \"nvcf-image-credential-helper\". Only override this if you know what you are doing. If not specified, it is nvcf-image-credential-helper under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).",
                             "default": ""
                         },
                         "imageTag": {
                             "type": "string",
                             "description": "(REQUIRED) Image tag of \"nvcf-image-credential-helper\". Only override this if you know what you are doing.",
-                            "default": "0.11.1"
+                            "default": "0.11.4"
                         }
                     }
                 },
@@ -1132,13 +1176,12 @@
                         },
                         "imageRepository": {
                             "type": "string",
-                            "description": "(OPTIONAL) Image repository of \"otel-collector\". Only override this if you know what you are doing. If not specified, it will be calculated based on image.repository.",
+                            "description": "(OPTIONAL) Image repository of \"otel-collector\". Only override this if you know what you are doing. If not specified, it is nvcf-otel-collector under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).",
                             "default": ""
                         },
                         "imageTag": {
                             "type": "string",
-                            "description": "(REQUIRED) Image tag of \"otel-collector\". Only override this if you know what you are doing.",
-                            "default": "0.160.0-nv-0.2.5"
+                            "description": "(REQUIRED) Image tag of \"otel-collector\". Only override this if you know what you are doing."
                         }
                     }
                 },

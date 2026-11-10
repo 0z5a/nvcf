@@ -26,27 +26,32 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/servicetier"
 )
 
 type Config struct {
-	Telemetry          TelemetryConfig
-	Server             ServerConfig
-	Stargate           StargateConfig
-	NVCF               NVCFConfig
-	Olric              OlricConfig
-	RateLimiter        RateLimiterConfig
-	RateLimitSync      RateLimitSynchronizationConfig
-	DefaultServiceTier servicetier.Tier
-	DefaultTPM         int64
-	DefaultRPM         int64
-	ModelCapabilities  map[string]ModelCapabilities
+	Telemetry         TelemetryConfig
+	Server            ServerConfig
+	Stargate          StargateConfig
+	NVCF              NVCFConfig
+	Olric             OlricConfig
+	RateLimiter       RateLimiterConfig
+	RateLimitSync     RateLimitSynchronizationConfig
+	DefaultTPM        int64
+	DefaultRPM        int64
+	ModelCapabilities map[string]ModelCapabilities
 	// ModelURIAllowlistEnabled refuses requests to endpoints a model does
 	// not declare in its uris allowlist. When false, undeclared endpoints
 	// are only counted and logged so enforcement can roll out per
 	// environment.
 	ModelURIAllowlistEnabled bool
+	// ExposeRouterErrorCodes puts the request router's rejection reason, such
+	// as no_eligible_candidates, in error.code of OpenAI-format error
+	// responses. When false, the reason is only logged.
+	ExposeRouterErrorCodes bool
+	// DecisionImageTokens is the flat input token estimate for each image in
+	// a /v1/decisions or /v1/systemone request. The image payload is never
+	// counted by size. Zero counts images as free.
+	DecisionImageTokens int
 }
 
 type ServerConfig struct {
@@ -205,6 +210,14 @@ func (c ModelCapabilities) SupportsSpeechToSpeech() bool {
 	return c.SpeechToSpeech == nil || *c.SpeechToSpeech
 }
 
+// defaultDecisionImageTokens is a placeholder estimate per image until the
+// decision model owners set a measured value with NVCF_DECISION_IMAGE_TOKENS.
+const defaultDecisionImageTokens = 1024
+
+// defaultMaxRequestBodyBytes matches the 50 MB request payload cap OpenAI
+// documents for image inputs.
+const defaultMaxRequestBodyBytes int64 = 50 << 20
+
 func Default() *Config {
 	return &Config{
 		Telemetry: TelemetryConfig{
@@ -219,6 +232,7 @@ func Default() *Config {
 			InferenceWriteTimeout: 60 * time.Second,
 			IdleTimeout:           60 * time.Second,
 			Region:                "global",
+			MaxRequestBodyBytes:   defaultMaxRequestBodyBytes,
 		},
 		Stargate: StargateConfig{
 			URL:            "http://127.0.0.1:8000",
@@ -247,6 +261,7 @@ func Default() *Config {
 			Enabled:  true,
 			FailOpen: true,
 		},
+		DecisionImageTokens: defaultDecisionImageTokens,
 		RateLimitSync: RateLimitSynchronizationConfig{
 			ApplyRemote: true,
 			NATS: RateLimitNATSConfig{
@@ -254,7 +269,6 @@ func Default() *Config {
 				ConnectTimeout: 5 * time.Second,
 			},
 		},
-		DefaultServiceTier: servicetier.Auto,
 	}
 }
 
@@ -279,6 +293,9 @@ func LoadFromEnv() (*Config, error) {
 
 	if v, ok := errs.boolean("MODEL_URI_ALLOWLIST_ENABLED"); ok {
 		cfg.ModelURIAllowlistEnabled = v
+	}
+	if v, ok := errs.boolean("NVCF_GATEWAY_EXPOSE_ROUTER_ERROR_CODES"); ok {
+		cfg.ExposeRouterErrorCodes = v
 	}
 
 	// SecretsPath is populated by applyStargateNVCFEnv above.
@@ -532,21 +549,20 @@ func applyRateLimitEnv(cfg *Config, errs *envErrs) {
 }
 
 func applyDefaultModelEnv(cfg *Config, errs *envErrs) {
-	if tier := os.Getenv("NVCF_DEFAULT_SERVICE_TIER"); tier != "" {
-		var parsed servicetier.Tier
-		if err := parsed.UnmarshalText([]byte(tier)); err != nil {
-			errs.add("NVCF_DEFAULT_SERVICE_TIER", tier, err)
-		} else {
-			cfg.DefaultServiceTier = parsed
-		}
-	}
-
 	if tpm, ok := errs.integer64("NVCF_DEFAULT_TPM"); ok {
 		cfg.DefaultTPM = tpm
 	}
 
 	if rpm, ok := errs.integer64("NVCF_DEFAULT_RPM"); ok {
 		cfg.DefaultRPM = rpm
+	}
+
+	if tokens, ok := errs.integer("NVCF_DECISION_IMAGE_TOKENS"); ok {
+		if tokens < 0 {
+			errs.add("NVCF_DECISION_IMAGE_TOKENS", strconv.Itoa(tokens), errors.New("must be >= 0"))
+		} else {
+			cfg.DecisionImageTokens = tokens
+		}
 	}
 
 	if raw := os.Getenv("NVCF_MODEL_CAPABILITIES"); raw != "" {

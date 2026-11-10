@@ -20,12 +20,14 @@ package steps
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cucumber/godog"
 	"nvcf-bdd/harness"
 )
 
@@ -96,6 +98,28 @@ func TestHTTPStatusAssertion(t *testing.T) {
 	}
 }
 
+func TestHTTPHeaderAssertion(t *testing.T) {
+	sc, _ := newHTTPScenario(t, harness.HTTPResponse{Status: 429, Header: http.Header{"Retry-After": {"7"}}})
+	if err := sc.theHTTPHeaderShouldEqual("Retry-After", "7"); err == nil {
+		t.Fatal("assertion must fail before any request")
+	}
+	if err := sc.iSendHTTPRequest(context.Background(), "POST", "http://x/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.theHTTPHeaderShouldEqual("retry-after", "7"); err != nil {
+		t.Fatalf("matching header: %v", err)
+	}
+	if err := sc.theHTTPHeaderShouldEqual("Retry-After", "8"); err == nil || !strings.Contains(err.Error(), `"7"`) {
+		t.Fatalf("expected mismatch naming the actual value, got %v", err)
+	}
+	if err := sc.theHTTPHeaderShouldEqual("X-Missing", "7"); err == nil || !strings.Contains(err.Error(), "absent") {
+		t.Fatalf("expected absent header failure, got %v", err)
+	}
+	if err := sc.theHTTPHeaderShouldEqual(" ", "7"); err == nil {
+		t.Fatal("blank header name accepted")
+	}
+}
+
 func TestHTTPStatusOneOfAssertion(t *testing.T) {
 	sc, _ := newHTTPScenario(t, harness.HTTPResponse{Status: 403, Body: "forbidden"})
 	if err := sc.iSendHTTPRequest(context.Background(), "POST", "http://x/"); err != nil {
@@ -148,6 +172,19 @@ func TestHTTPBodyAndJSONAssertions(t *testing.T) {
 	}
 	if err := sc.theHTTPJSONFieldShouldBeAtLeast("summary.by_event.InstanceReady", 1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHTTPJSONFieldAbsentAssertion(t *testing.T) {
+	sc, _ := newHTTPScenario(t, harness.HTTPResponse{Status: 200, Body: `{"choices":[{"message":{"content":"{\"ignore_eos\":true}"}}]}`})
+	if err := sc.iSendHTTPRequest(context.Background(), "POST", "http://x/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.theHTTPJSONFieldShouldBeAbsent("choices.0.message.content.include_reasoning"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.theHTTPJSONFieldShouldBeAbsent("choices.0.message.content.ignore_eos"); err == nil {
+		t.Fatal("absent must fail when the field is present")
 	}
 }
 
@@ -260,5 +297,53 @@ func TestTruncatedBodyDoesNotLeavePartOfAKey(t *testing.T) {
 	got := truncateBody(body)
 	if strings.Contains(got, "nvapi-") || strings.Contains(got, "PartlyVisible") {
 		t.Fatalf("part of the key survived truncation: %q", got)
+	}
+}
+
+func TestFunctionKeyHeaderUsesSavedKeyForOneRequest(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sc, fake := newHTTPScenario(t, harness.HTTPResponse{Status: 200})
+	sc.NVCFCLIConfig = "/some/path/llm.yaml"
+	state := filepath.Join(home, ".nvcf-cli.llm.state")
+	if err := os.WriteFile(state, []byte(`{"token":"different-admin-token","apiKey":"nvapi-test-function"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.theHTTPRequestHeaderIsFunctionAPIKey("Authorization", "Bearer "); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.iSendHTTPRequestWithTimeout(context.Background(), "POST", "http://sample.test", 120, &godog.DocString{Content: `{"stream":true}`}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.headers["Authorization"] != "Bearer nvapi-test-function" || fake.body != `{"stream":true}` {
+		t.Fatal("request lost its function key or body")
+	}
+	if err := sc.iSendHTTPRequest(context.Background(), "GET", "http://sample.test"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.headers["Authorization"] != "" {
+		t.Fatal("key leaked to the next request")
+	}
+}
+
+func TestHTTPObservationsRejectMissingResponseAndInvalidInputs(t *testing.T) {
+	sc, _ := newHTTPScenario(t, harness.HTTPResponse{Status: 200})
+	if err := sc.theHTTPBodyShouldEndWith("data: [DONE]"); err == nil {
+		t.Fatal("suffix accepted missing response")
+	}
+	if err := sc.theHTTPResponseShouldTakeAtLeast("60s"); err == nil {
+		t.Fatal("duration accepted missing response")
+	}
+	sc.LastHTTP = &harness.HTTPResponse{Status: 200, Body: "data: [DONE]\n\n", Elapsed: 90 * time.Second}
+	for _, value := range []string{"", " ", "-1s", "60"} {
+		if err := sc.theHTTPResponseShouldTakeAtLeast(value); err == nil {
+			t.Errorf("duration accepted %q", value)
+		}
+	}
+	if err := sc.theHTTPBodyShouldEndWith(" "); err == nil {
+		t.Fatal("blank suffix accepted")
+	}
+	if err := sc.iSendHTTPRequestWithTimeout(context.Background(), "POST", "http://sample.test", 0, &godog.DocString{}); err == nil {
+		t.Fatal("unbounded timeout accepted")
 	}
 }

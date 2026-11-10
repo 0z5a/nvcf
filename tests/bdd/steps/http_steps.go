@@ -45,12 +45,19 @@ func registerHTTPSteps(ctx *godog.ScenarioContext, sc *ScenarioContext) {
 	ctx.Step(`^I send an? "([A-Z]+)" request to "([^"]*)"$`, sc.iSendHTTPRequest)
 	ctx.Step(`^I send an? "([A-Z]+)" request to "([^"]*)" with body:$`, sc.iSendHTTPRequestWithBody)
 	ctx.Step(`^I poll "([A-Z]+)" "([^"]*)" for up to (\d+) seconds until the HTTP response body contains "([^"]*)"$`, sc.iPollHTTPUntilBodyContains)
+	ctx.Step(`^the HTTP request header "([^"]*)" is the NVCF CLI function API key with prefix "([^"]*)"$`, sc.theHTTPRequestHeaderIsFunctionAPIKey)
+	ctx.Step(`^I send an? "([A-Z]+)" request to "([^"]*)" with timeout (\d+) seconds and body:$`, sc.iSendHTTPRequestWithTimeout)
+	ctx.Step(`^the HTTP response should take at least "([^"]*)"$`, sc.theHTTPResponseShouldTakeAtLeast)
+	ctx.Step(`^the HTTP response body should end with "([^"]*)"$`, sc.theHTTPBodyShouldEndWith)
 	ctx.Step(`^the HTTP status should be (\d+)$`, sc.theHTTPStatusShouldBe)
 	ctx.Step(`^the HTTP status should be (\d+) or (\d+)$`, sc.theHTTPStatusShouldBeOneOf)
+	ctx.Step(`^the HTTP response header "([^"]*)" should equal "([^"]*)"$`, sc.theHTTPHeaderShouldEqual)
 	ctx.Step(`^the HTTP response body should contain "([^"]*)"$`, sc.theHTTPBodyShouldContain)
 	ctx.Step(`^the HTTP response body should not contain "([^"]*)"$`, sc.theHTTPBodyShouldNotContain)
 	ctx.Step(`^the HTTP response JSON field "([^"]*)" should equal "([^"]*)"$`, sc.theHTTPJSONFieldShouldEqual)
 	ctx.Step(`^the HTTP response JSON field "([^"]*)" should be at least (\d+)$`, sc.theHTTPJSONFieldShouldBeAtLeast)
+	ctx.Step(`^the HTTP response JSON field "([^"]*)" should be absent$`, sc.theHTTPJSONFieldShouldBeAbsent)
+	ctx.Step(`^the HTTP response JSON field "([^"]*)" should be less than (\d+)$`, sc.theHTTPJSONFieldShouldBeLessThan)
 	ctx.Step(`^I export the HTTP response JSON field "([^"]*)" to environment variable "([^"]*)"$`, sc.iExportHTTPJSONField)
 }
 
@@ -176,6 +183,25 @@ func (sc *ScenarioContext) theHTTPStatusShouldBeOneOf(first, second int) error {
 	return nil
 }
 
+func (sc *ScenarioContext) theHTTPHeaderShouldEqual(name, value string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("http response header name must be non-empty")
+	}
+	resp, err := sc.requireHTTP()
+	if err != nil {
+		return err
+	}
+	want := dsl.Interpolate(value)
+	got := resp.Header.Values(name)
+	if len(got) == 0 {
+		return fmt.Errorf("http response header %q is absent", name)
+	}
+	if got[0] != want {
+		return fmt.Errorf("http response header %q = %q, want %q", name, dsl.RedactSecrets(got[0]), dsl.RedactSecrets(want))
+	}
+	return nil
+}
+
 func (sc *ScenarioContext) theHTTPBodyShouldContain(text string) error {
 	resp, err := sc.requireHTTP()
 	if err != nil {
@@ -221,12 +247,28 @@ func (sc *ScenarioContext) theHTTPJSONFieldShouldEqual(path, want string) error 
 	return nil
 }
 
+func (sc *ScenarioContext) theHTTPJSONFieldShouldBeAbsent(path string) error {
+	resp, err := sc.requireHTTP()
+	if err != nil {
+		return err
+	}
+	return dsl.JSONFieldAbsent(resp.Body, path)
+}
+
 func (sc *ScenarioContext) theHTTPJSONFieldShouldBeAtLeast(path string, min int) error {
 	resp, err := sc.requireHTTP()
 	if err != nil {
 		return err
 	}
 	return dsl.JSONFieldAtLeast(resp.Body, path, float64(min))
+}
+
+func (sc *ScenarioContext) theHTTPJSONFieldShouldBeLessThan(path string, max int) error {
+	resp, err := sc.requireHTTP()
+	if err != nil {
+		return err
+	}
+	return dsl.JSONFieldLessThan(resp.Body, path, float64(max))
 }
 
 // iExportHTTPJSONField stores a response field in an env var through the
@@ -264,4 +306,58 @@ func truncateBody(body string) string {
 		return redacted
 	}
 	return redacted[:maxHTTPFailureBody] + "..." + strconv.Itoa(len(redacted)) + " bytes"
+}
+
+func (sc *ScenarioContext) theHTTPRequestHeaderIsFunctionAPIKey(name, prefix string) error {
+	if sc.NVCFCLIConfig == "" {
+		return fmt.Errorf("no NVCF CLI config selected; use 'I use NVCF CLI config' first")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home dir: %w", err)
+	}
+	key, err := dsl.CLIStateAPIKey(dsl.CLIStatePath(home, sc.NVCFCLIConfig))
+	if err != nil {
+		return err
+	}
+	return sc.theHTTPRequestHeaderIs(name, prefix+key)
+}
+
+func (sc *ScenarioContext) iSendHTTPRequestWithTimeout(ctx context.Context, method, url string, seconds int, doc *godog.DocString) error {
+	if seconds <= 0 {
+		return fmt.Errorf("HTTP timeout must be positive")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
+	defer cancel()
+	return sc.sendHTTP(ctx, method, url, doc.Content)
+}
+
+func (sc *ScenarioContext) theHTTPResponseShouldTakeAtLeast(minimum string) error {
+	resp, err := sc.requireHTTP()
+	if err != nil {
+		return err
+	}
+	duration, err := time.ParseDuration(dsl.Interpolate(minimum))
+	if err != nil || duration < 0 {
+		return fmt.Errorf("minimum HTTP duration must be a non-negative Go duration")
+	}
+	if resp.Elapsed < duration {
+		return fmt.Errorf("HTTP response took %s, want at least %s", resp.Elapsed, duration)
+	}
+	return nil
+}
+
+func (sc *ScenarioContext) theHTTPBodyShouldEndWith(text string) error {
+	resp, err := sc.requireHTTP()
+	if err != nil {
+		return err
+	}
+	want := dsl.Interpolate(text)
+	if strings.TrimSpace(want) == "" {
+		return fmt.Errorf("expected suffix must be non-empty")
+	}
+	if !strings.HasSuffix(strings.TrimRight(resp.Body, " \t\r\n"), want) {
+		return fmt.Errorf("HTTP response body does not end with %q: %s", dsl.RedactSecrets(want), truncateBody(resp.Body))
+	}
+	return nil
 }

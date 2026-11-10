@@ -20,6 +20,7 @@ package dsl
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -27,23 +28,74 @@ import (
 // JSONField reads the dotted path from a JSON document and returns the value
 // as text. Object keys are matched by name and array elements by decimal
 // index, so "events.0.event_name" reads the first event. Scalars come back as
-// their plain text; objects and arrays come back as compact JSON.
+// their plain text; objects and arrays come back as compact JSON. A path can
+// continue into a string that holds a JSON object or array, such as a request
+// an echo sample returns as its reply text.
 func JSONField(raw, path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("json path must be non-empty")
 	}
+	node, err := jsonNode(raw, strings.Split(path, "."))
+	if err != nil {
+		return "", fmt.Errorf("json path %q: %w", path, err)
+	}
+	return nodeText(node)
+}
+
+// JSONFieldAbsent reports an error unless the last key of the dotted path is
+// missing from an object that exists, so a misspelled parent cannot pass.
+func JSONFieldAbsent(raw, path string) error {
+	parts := strings.Split(path, ".")
+	if strings.TrimSpace(path) == "" || len(parts) < 2 {
+		return fmt.Errorf("json path %q must name a key inside an object", path)
+	}
+	parent, err := jsonNode(raw, parts[:len(parts)-1])
+	if err != nil {
+		return fmt.Errorf("json path %q: %w", path, err)
+	}
+	object, ok := decodeEmbedded(parent).(map[string]any)
+	if !ok {
+		return fmt.Errorf("json path %q: parent is not an object", path)
+	}
+	if value, found := object[parts[len(parts)-1]]; found {
+		text, _ := nodeText(value)
+		return fmt.Errorf("json path %q is present with value %q, want absent", path, text)
+	}
+	return nil
+}
+
+func jsonNode(raw string, parts []string) (any, error) {
 	var node any
 	if err := json.Unmarshal([]byte(raw), &node); err != nil {
-		return "", fmt.Errorf("parse json: %w", err)
+		return nil, fmt.Errorf("parse json: %w", err)
 	}
-	for _, part := range strings.Split(path, ".") {
-		next, err := childNode(node, part)
+	for _, part := range parts {
+		next, err := childNode(decodeEmbedded(node), part)
 		if err != nil {
-			return "", fmt.Errorf("json path %q: %w", path, err)
+			return nil, err
 		}
 		node = next
 	}
-	return nodeText(node)
+	return node, nil
+}
+
+// decodeEmbedded returns the object or array a string holds as JSON text, and
+// any other value unchanged.
+func decodeEmbedded(node any) any {
+	text, ok := node.(string)
+	if !ok {
+		return node
+	}
+	var embedded any
+	if err := json.Unmarshal([]byte(text), &embedded); err != nil {
+		return node
+	}
+	switch embedded.(type) {
+	case map[string]any, []any:
+		return embedded
+	default:
+		return node
+	}
 }
 
 // JSONFieldAtLeast reports whether the numeric value at the dotted path is
@@ -53,14 +105,41 @@ func JSONFieldAtLeast(raw, path string, min float64) error {
 	if err != nil {
 		return err
 	}
-	value, err := strconv.ParseFloat(text, 64)
+	value, err := jsonNumber(path, text)
 	if err != nil {
-		return fmt.Errorf("json path %q is not a number: %q", path, text)
+		return err
 	}
 	if value < min {
 		return fmt.Errorf("json path %q = %v, want at least %v", path, value, min)
 	}
 	return nil
+}
+
+// JSONFieldLessThan reports whether the numeric value at the dotted path is
+// below max.
+func JSONFieldLessThan(raw, path string, max float64) error {
+	text, err := JSONField(raw, path)
+	if err != nil {
+		return err
+	}
+	value, err := jsonNumber(path, text)
+	if err != nil {
+		return err
+	}
+	if value >= max {
+		return fmt.Errorf("json path %q = %v, want less than %v", path, value, max)
+	}
+	return nil
+}
+
+// jsonNumber parses a numeric field. ParseFloat accepts "NaN", which compares
+// false against every bound, so reject it.
+func jsonNumber(path, text string) (float64, error) {
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(value) {
+		return 0, fmt.Errorf("json path %q is not a number: %q", path, text)
+	}
+	return value, nil
 }
 
 func childNode(node any, part string) (any, error) {

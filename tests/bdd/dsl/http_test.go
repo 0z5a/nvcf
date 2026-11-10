@@ -66,6 +66,43 @@ func TestJSONFieldErrors(t *testing.T) {
 	}
 }
 
+// echoReply carries a request body as a JSON string, the way an echo
+// sample returns the request it received.
+const echoReply = `{"choices":[{"message":{"content":"{\"ignore_eos\":true,\"chat_template_kwargs\":{\"enable_thinking\":false},\"messages\":[{\"content\":[{\"type\":\"text\"},{\"type\":\"audio_url\"}]}]}"}}]}`
+
+func TestJSONFieldDescendsIntoJSONEncodedStrings(t *testing.T) {
+	cases := map[string]string{
+		"choices.0.message.content.ignore_eos":                           "true",
+		"choices.0.message.content.chat_template_kwargs":                 `{"enable_thinking":false}`,
+		"choices.0.message.content.messages.0.content.1.type":            "audio_url",
+		"choices.0.message.content.chat_template_kwargs.enable_thinking": "false",
+	}
+	for path, want := range cases {
+		got, err := JSONField(echoReply, path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if got != want {
+			t.Fatalf("%s = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestJSONFieldAbsent(t *testing.T) {
+	for path, wantErr := range map[string]bool{
+		"choices.0.message.content.include_reasoning": false,
+		"choices.0.message.content.ignore_eos":        true,
+		"choices.0.message.typo.include_reasoning":    true,
+		"choices.0.message.content.ignore_eos.child":  true,
+		"choices": true,
+		"":        true,
+	} {
+		if err := JSONFieldAbsent(echoReply, path); (err != nil) != wantErr {
+			t.Fatalf("%q: err = %v, want error %v", path, err, wantErr)
+		}
+	}
+}
+
 func TestJSONFieldAtLeast(t *testing.T) {
 	if err := JSONFieldAtLeast(ledgerEvents, "summary.by_event.InstanceReady", 1); err != nil {
 		t.Fatalf("at least 1: %v", err)
@@ -75,6 +112,24 @@ func TestJSONFieldAtLeast(t *testing.T) {
 	}
 	if err := JSONFieldAtLeast(ledgerEvents, "namespace", 1); err == nil {
 		t.Fatal("expected failure for non-numeric field")
+	}
+}
+
+func TestJSONFieldLessThan(t *testing.T) {
+	cases := []struct {
+		path    string
+		max     float64
+		wantErr bool
+	}{
+		{"summary.by_event.InstanceReady", 3, false},
+		{"summary.by_event.InstanceReady", 2, true},
+		{"namespace", 3, true},
+		{"missing", 3, true},
+	}
+	for _, tc := range cases {
+		if err := JSONFieldLessThan(ledgerEvents, tc.path, tc.max); (err != nil) != tc.wantErr {
+			t.Fatalf("%s < %v: err = %v, want error %v", tc.path, tc.max, err, tc.wantErr)
+		}
 	}
 }
 
@@ -103,5 +158,47 @@ func TestCLIStateToken(t *testing.T) {
 	}
 	if _, err := CLIStateToken(filepath.Join(dir, "absent")); err == nil {
 		t.Fatal("expected read error")
+	}
+}
+
+func TestCLIStateAPIKeyRequiresKeyAndDoesNotDiscloseState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cli.state")
+	for _, tc := range []struct {
+		name, body string
+		wantError  bool
+	}{
+		{"function key", `{"apiKey":"nvapi-private-value","token":"admin-value"}`, false},
+		{"admin token only", `{"token":"admin-value"}`, true},
+		{"invalid JSON", `{"apiKey":"nvapi-private-value",`, true},
+		{"wrong type", `{"apiKey":{"secret":"nvapi-private-value"}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			key, err := CLIStateAPIKey(path)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !tc.wantError && key != "nvapi-private-value" {
+				t.Fatal("did not read function key")
+			}
+			if err != nil && (strings.Contains(err.Error(), "nvapi-private-value") || strings.Contains(err.Error(), "admin-value")) {
+				t.Fatal("error disclosed state")
+			}
+		})
+	}
+	if _, err := CLIStateAPIKey(path + "-missing"); err == nil {
+		t.Fatal("missing state accepted")
+	}
+}
+
+func TestJSONFieldNumericComparisonsRejectNaN(t *testing.T) {
+	const raw = `{"score":"NaN"}`
+	if err := JSONFieldLessThan(raw, "score", 1); err == nil {
+		t.Fatal("JSONFieldLessThan accepted NaN")
+	}
+	if err := JSONFieldAtLeast(raw, "score", 0); err == nil {
+		t.Fatal("JSONFieldAtLeast accepted NaN")
 	}
 }

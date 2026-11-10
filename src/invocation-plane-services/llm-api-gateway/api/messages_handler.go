@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -19,12 +20,12 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/ratelimit"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/provider"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/ratelimit"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 // Only fields used for routing and admission are bound. Content blocks and
@@ -184,6 +185,9 @@ func (h *MessagesHandlers) ServeMessages(ec echo.Context) error {
 	generationPossible = upstreamAccepted
 	copyProxyHeaders(c.Response().Header(), resp.Header)
 	setMultiTurnSessionResponseHeader(c)
+	if err := proxyUpstreamError(resp); err != nil {
+		return err
+	}
 	c.Response().WriteHeader(resp.StatusCode)
 	if resp.Body == nil {
 		return nil
@@ -204,7 +208,8 @@ func (h *MessagesHandlers) ServeMessages(ec echo.Context) error {
 	if observer.stream {
 		writer = messagesFlushWriter{c.Response().Writer}
 	}
-	_, err = io.Copy(writer, reader)
+	relay := &messagesRelayWriter{writer: writer}
+	_, err = io.Copy(relay, reader)
 	copyComplete = err == nil
 	observer.finish()
 	if observer.stream {
@@ -221,7 +226,62 @@ func (h *MessagesHandlers) ServeMessages(ec echo.Context) error {
 			telemetry.RecordWithContext(c.UserContext(), h.handlers.observability.streamFirstToken, observer.firstOutput.Sub(start).Seconds(), attribute.String("endpoint", messagesEndpointPath), telemetry.FunctionIDAttribute(requestFunctionID(c)))
 		}
 	}
-	return err
+	// A client that left is not an upstream failure.
+	if !upstreamAccepted || relay.writeErr != nil || c.UserContext().Err() != nil {
+		return err
+	}
+	return failMessagesRelay(c, relay, observer, err)
+}
+
+// failMessagesRelay records a response the upstream did not finish after the 200
+// as 502. The Anthropic SDK raises on an error event but never checks for
+// message_stop, so a failed stream also ends with one.
+func failMessagesRelay(c *GatewayContext, relay *messagesRelayWriter, observer *messagesUsageObserver, readErr error) error {
+	failure := echo.NewHTTPError(http.StatusBadGateway, msgUpstreamStreamIncomplete)
+	var cause error
+	switch {
+	case observer.failed && !relay.frameOpen():
+		// The client already has the whole upstream error event.
+		return failure.SetInternal(errors.Join(&provider.UpstreamStreamError{}, readErr))
+	case observer.failed:
+		// The upstream error event was cut, so the client cannot parse it.
+		cause = errors.Join(&provider.UpstreamStreamError{}, readErr)
+	case observer.stream && !observer.encoded && observer.stopped:
+		// message_stop ended the stream; a later read error does not change it.
+		return nil
+	case readErr != nil:
+		cause = fmt.Errorf("%w: read messages stream: %w", provider.ErrStreamIncomplete, readErr)
+	case observer.stream && !observer.encoded:
+		cause = fmt.Errorf("%w: messages stream ended before message_stop", provider.ErrStreamIncomplete)
+	default:
+		return nil
+	}
+	// A JSON body or a compressed stream cannot take an added event.
+	if !observer.stream || observer.encoded {
+		return failure.SetInternal(cause)
+	}
+
+	var event bytes.Buffer
+	if relay.frameOpen() {
+		// Clients skip ping events, so the partial data of a cut frame is never parsed.
+		if !relay.endsLine() {
+			event.WriteByte('\n')
+		}
+		event.WriteString("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+	}
+	payload, err := json.Marshal(anthropicErrorResponse{
+		Type:      "error",
+		Error:     anthropicError{Type: anthropicErrorType(http.StatusBadGateway), Message: msgUpstreamStreamIncomplete},
+		RequestID: errorRequestID(c),
+	})
+	if err != nil {
+		return failure.SetInternal(errors.Join(cause, err))
+	}
+	event.WriteString("event: error\ndata: ")
+	event.Write(payload)
+	event.WriteString("\n\n")
+	_, err = relay.Write(event.Bytes())
+	return failure.SetInternal(errors.Join(cause, err))
 }
 
 func rewriteMessagesBody(body []byte, model string) ([]byte, error) {
@@ -261,39 +321,6 @@ func validateMessagesFieldNames(body []byte) error {
 	return nil
 }
 
-// Only gateway-generated errors use this envelope. Backend bodies are relayed.
-func messagesHTTPErrorHandler(err error, c echo.Context) {
-	if c.Response().Committed {
-		return
-	}
-	status, message := http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError)
-	var he *echo.HTTPError
-	if errors.As(err, &he) {
-		status = he.Code
-		if public, ok := he.Message.(string); ok {
-			message = public
-		}
-	}
-	kind := "api_error"
-	switch status {
-	case 400, 405, 422:
-		kind = "invalid_request_error"
-	case 401:
-		kind = "authentication_error"
-	case 403:
-		kind = "permission_error"
-	case 404:
-		kind = "not_found_error"
-	case 413:
-		kind = "request_too_large"
-	case 429:
-		kind = "rate_limit_error"
-	case 529:
-		kind = "overloaded_error"
-	}
-	_ = c.JSON(status, map[string]any{"type": "error", "error": map[string]string{"type": kind, "message": message}, "request_id": c.Response().Header().Get(HeaderRequestID)})
-}
-
 // NVCF authenticates with Authorization before proxying. Stargate adds its own
 // routing headers; pylon consumes them before applying the backend policy.
 func messagesForwardedHeaders(src http.Header) http.Header {
@@ -318,6 +345,45 @@ func (w messagesFlushWriter) Write(p []byte) (int, error) {
 		err = http.NewResponseController(w.ResponseWriter).Flush()
 	}
 	return n, err
+}
+
+// messagesRelayWriter keeps what a failed relay needs: whether the client write
+// failed, and the last bytes sent, which tell whether an SSE frame is still open.
+type messagesRelayWriter struct {
+	writer   io.Writer
+	tail     []byte
+	writeErr error
+}
+
+func (w *messagesRelayWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	w.tail = append(w.tail, p[max(0, n-4):n]...)
+	if len(w.tail) > 4 {
+		w.tail = w.tail[len(w.tail)-4:]
+	}
+	if err != nil {
+		w.writeErr = err
+	}
+	return n, err
+}
+
+// frameOpen reports whether the bytes sent stop inside an SSE frame, that is,
+// not right after a blank line.
+func (w *messagesRelayWriter) frameOpen() bool {
+	rest := w.tail
+	switch {
+	case bytes.HasSuffix(rest, []byte("\r\n")):
+		rest = rest[:len(rest)-2]
+	case w.endsLine():
+		rest = rest[:len(rest)-1]
+	default:
+		return len(rest) > 0
+	}
+	return len(rest) > 0 && rest[len(rest)-1] != '\n' && rest[len(rest)-1] != '\r'
+}
+
+func (w *messagesRelayWriter) endsLine() bool {
+	return len(w.tail) > 0 && (w.tail[len(w.tail)-1] == '\n' || w.tail[len(w.tail)-1] == '\r')
 }
 
 type messagesUsage struct {
@@ -363,6 +429,8 @@ func (u messagesUsage) chatUsage() *models.ChatCompletionUsage {
 
 // Usage observation is best effort and bounded. Oversized or unknown events
 // still pass through byte for byte; they never block delivery to the client.
+// Completion detection shares this limit: a message_stop event over it counts as
+// a stream that ended before message_stop.
 const messagesUsageBufferLimit = 1 << 20
 
 type messagesUsageObserver struct {

@@ -173,6 +173,16 @@ Transient errors, malformed events, and EOF do not switch `auto` to fallback.
 Fallback reads streamed OpenAI usage fields such as `usage.completion_tokens` or
 `output_tokens_so_far`. Text peeking is last resort.
 
+Fallback input throughput uses each request's interval from submission to first
+output. The newest 8 requests define the busy time, which is the union of their
+intervals. The rate is the input tokens of every request whose first output
+falls in that busy time, divided by its length. This includes older requests,
+so the rate stays correct when more requests are in prefill at once than the
+window holds. The window size sets smoothing, not a concurrency limit. A request
+whose interval is longer than the busy time counts only the tokens its own rate
+would process in that time. This stops one long prefill from inflating a short
+window.
+
 Fallback input throughput counts only uncached prompt tokens when usage reports
 `cached_tokens` (Chat `prompt_tokens_details` or Responses
 `input_tokens_details`), and total prompt tokens otherwise. Chat Completions
@@ -225,8 +235,9 @@ If request stats go stale, volatile output TPS is cleared. Sticky input TPS
 stays until a later valid sample replaces it.
 The maximum is the greatest max-eligible `last_mean_input_tps` published for the
 current model generation. A configured `--initial-input-tps`, engine stats
-stream counters, embeddings samples, and calibration can raise it. An OpenAI
-fallback mean raises it only when every request in its window counted uncached
+stream counters, embeddings and decision request samples, and calibration can
+raise it. An OpenAI
+fallback mean raises it only when every request it counts reported uncached
 prompt tokens under the Fallback rules above. Other fallback means update
 `last_mean_input_tps` but not the maximum, because cached input may be counted
 as prefill. The maximum follows the smoothed mean rather than individual
@@ -282,7 +293,8 @@ does not inflate that gauge.
 ## Mock Defaults
 
 `mock-dynamo` serves the stats stream, OpenAI-compatible
-chat/Responses/embeddings endpoints, and `/kv-cache/stats`. Use
+chat/Responses/embeddings endpoints, the decision routes, and
+`/kv-cache/stats`. Use
 `pylon --engine-stats-stream=off` when a test intentionally exercises OpenAI
 fallback.
 

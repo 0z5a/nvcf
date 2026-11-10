@@ -81,6 +81,10 @@ Important settings to review before deployment:
 - `vanityGateway.replicaCount`, resource requests, and limits for your
   environment
 - `vanityGateway.config.nvcfApiEndpoint` for the invocation endpoint
+- `vanityGateway.config.nvcfControlPlaneEndpoint` for the NVCF API base URL
+  used to list the private models a caller's API key may access, empty
+  (disabled) by default. In the self-managed stack, set it to
+  `http://api.nvcf.svc.cluster.local:8080`.
 - `vanityGateway.config.llmGatewayEndpoint` for the LLM Gateway endpoint, used
   only by models that set `functionType: LLM`
 - `vanityGateway.config.otelExporterOtlpEndpoint` for trace export, empty by
@@ -106,14 +110,18 @@ or the pod is killed mid-drain.
 
 ## Route mapping
 
-`vanityGateway.mappingConfig.v2config` has three sections:
+`vanityGateway.mappingConfig.v2config` has four sections:
 
 - `openai`: per-endpoint model routes, keyed by endpoint (`chatCompletions`,
-  `completions`, `embeddings`, `responses`, and the image endpoints). Each route
-  requires `modelName` and `functionID`.
+  `completions`, `embeddings`, `responses`, `decisions`, and the image
+  endpoints). Each route requires `modelName` and `functionID`. `decisions`
+  serves the beta `POST /v1/decisions` route.
 - `anthropicMessages`: native Anthropic Messages model routes, served on
   `POST /v1/messages`. Routes use the same fields as `openai.chatCompletions`
   and share the API host set by `openai.host`.
+- `typesafeSystemOne`: beta TypeSafe System One model routes, served on
+  `POST /v1/systemone`. A top-level sibling of `anthropicMessages`, with the
+  same fields as `openai.decisions`.
 - `vanity`: host-based routes, each requiring a `host` and a `paths` map. Each
   path requires `path` and `functionID`.
 
@@ -123,13 +131,14 @@ across all routes.
 
 A model may set `functionType: LLM` to be served by the LLM Gateway instead of
 the invocation service, supported in `openai.chatCompletions`,
-`openai.responses`, `openai.embeddings`, and `anthropicMessages`. Callers still send the public `modelName`; the gateway
+`openai.responses`, `openai.embeddings`, `openai.decisions`, `anthropicMessages`, and
+`typesafeSystemOne`. Callers still send the public `modelName`; the gateway
 rewrites the request model to `functionID/modelName` before forwarding.
 
 The values schema enforces what the gateway checks at startup, so a values file
 that would fail the container fails the render instead:
 
-- `functionType` is rejected outside those four endpoints
+- `functionType` is rejected outside those endpoints
 - `usePexec`, `outgoingPathOverride`, and `sessionTimeout` are rejected on such
   a model, since the LLM Gateway ignores them. An explicit `false`, `""`, or `0`
   is accepted, because that is what an absent key produces
@@ -161,6 +170,43 @@ Clients call `POST /v1/messages` on the shared host with the public
 Messages. Upgrade Pylon workers, the Stargate router, and the LLM Gateway
 before enabling Messages routes. See `docs/overview/llm-gateway.md` for the
 request, accounting, and Claude Code details.
+
+Decision models (beta) are mapped per route. A model is enabled for a route only
+when listed in that route's section, and a function that serves both formats is
+listed in both:
+
+```yaml
+vanityGateway:
+  mappingConfig:
+    v2config:
+      openai:
+        host: api.example.com
+        decisions:
+          example_decision-model:
+            modelName: example/decision-model
+            functionID: <function-id>
+            functionVersionID: <function-version-id>
+          example_decision-model-llm:
+            modelName: example/decision-model-llm
+            functionID: <llm-function-id>
+            functionType: LLM
+      typesafeSystemOne:
+        example_decision-model:
+          modelName: example/decision-model
+          functionID: <function-id>
+          functionVersionID: <function-version-id>
+```
+
+Request and response bodies pass through unchanged, and responses are not
+streamed. With `usePexec: true` the invocation service normally sends the request
+to the default invocation path registered for the function, whichever route the
+client called, so a `usePexec: true` function serves only its default path.
+A function that serves both routes should set `usePexec: false`. Models with
+`functionType: LLM` need LLM Gateway and Stargate builds that serve these routes;
+enable them only after those builds run in the environment. Request body
+sampling (`promptCacheKey`, `firstMessageHash`) and `promptCacheKeyHeaders` are
+rejected in the decision sections. See the service README for error shapes and
+`/v1/models` behavior.
 
 Shadow traffic is supported. Each shadow target is resolved from the same model
 table and routed by its own `functionType`, so a shadow of an LLM model reaches
@@ -214,22 +260,26 @@ final. An explicit `random` must be last. Empty lists and entries, duplicates,
 unknown methods, and methods after `random` are rejected. A `100` percent target
 is admitted without parsing sampling material or drawing a random bucket.
 
-`promptCacheKey` and `firstMessageHash` are limited to `chatCompletions` and
-`responses`. `promptCacheKey` first uses a nonempty string
+`promptCacheKey` and `firstMessageHash` are limited to `chatCompletions`,
+`responses`, and `anthropicMessages`. `promptCacheKey` first uses a nonempty string
 `prompt_cache_key` from the JSON body, then checks `promptCacheKeyHeaders` in
 order. The body value is trimmed like header values, and a whitespace-only value
 is unavailable. This route-level header list applies to both shadow forms. It
 defaults to `x-multi-turn-session-id`; set it to `[]` to disable header lookup.
+Messages has no `prompt_cache_key` body field, so it reads only the header list,
+which defaults to `x-multi-turn-session-id`, then `x-claude-code-session-id`.
 A header is usable only when it has exactly one nonempty value after trimming.
 Only the value is hashed, so equal values receive equal buckets across body and
-header sources and across both endpoints. `Authorization` and `Proxy-Authorization`
+header sources and across endpoints. `Authorization` and `Proxy-Authorization`
 are rejected case-insensitively so credentials cannot be used as prompt cache
 keys.
 
 `firstMessageHash` uses a versioned, endpoint-specific canonical JSON envelope.
 For Chat Completions it hashes leading `system` and `developer` messages and the
 first `user` message. For Responses it hashes nonempty `instructions` and the
-first user input; a string `input` is user content. Object-key order is
+first user input; a string `input` is user content. For Messages it hashes a
+nonempty top-level `system` and the first `user` message, without
+`cache_control` keys. Object-key order is
 normalized, while array and content-part order is preserved. Later turns are
 ignored. Sampling is stateless and does not recover input through conversations,
 `previous_response_id`, or streamed deltas. A Responses request that continues
@@ -243,7 +293,9 @@ sample.
 All deterministic methods use SHA-256, the first 8 digest bytes as a big-endian
 integer, and modulo 100. Missing bearer credentials now reach the implicit
 `random` fallback for scalar `perBearerKey` configuration instead of skipping
-the target. Sampling does not change forwarded request bytes. Raw credentials,
+the target. `perBearerKey` reads only `Authorization: Bearer` and never
+`x-api-key`, including on `anthropicMessages` routes, so those requests use the
+next configured method or the implicit `random` fallback. Sampling does not change forwarded request bytes. Raw credentials,
 prompt cache keys, and message content are not added to telemetry.
 
 ## Notes

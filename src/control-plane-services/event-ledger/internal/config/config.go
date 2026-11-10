@@ -20,9 +20,9 @@ package config
 import (
 	"errors"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/common"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/common"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/tracing"
 )
 
 var (
@@ -59,6 +59,7 @@ type Config struct {
 	Pagination         PaginationConfig       `mapstructure:"pagination"`
 	Stats              StatsConfig            `mapstructure:"stats"`
 	Cache              CacheConfig            `mapstructure:"cache"`
+	V3                 V3Config               `mapstructure:"v3"`
 	ID                 string                 `mapstructure:"id"`
 	Secret             string                 `mapstructure:"secret"`
 	DeprecateEndpoints bool                   `mapstructure:"deprecate-endpoints"`
@@ -276,6 +277,14 @@ type StatsConfig struct {
 	FilteredStatsEnabledEventNames []string `mapstructure:"ngc-stats-enabled-event-names"`
 }
 
+// V3Config configures the v3 write path.
+type V3Config struct {
+	// AccountColumnsEnabled stores nca_id and function_id in their own columns.
+	// Enable it only after the event_ledger 04 migration has been applied. While
+	// disabled, those values stay in details.attributes and are not validated.
+	AccountColumnsEnabled bool `mapstructure:"account-columns-enabled"`
+}
+
 // CacheConfig configures the local stats write cache. The inactivity TTL is
 // derived from the flush interval and is not configurable.
 type CacheConfig struct {
@@ -292,7 +301,9 @@ type CacheConfig struct {
 // GetDefaultCacheConfig returns default cache configuration values
 func GetDefaultCacheConfig() CacheConfig {
 	return CacheConfig{
-		Enabled:              false,
+		Enabled: false,
+		// About 800 B per entry for a typical event: 100,000 entries is roughly 76 MiB,
+		// and larger event details add their size to every entry.
 		MaxSize:              100_000, // Entries kept before LRU eviction
 		FlushIntervalSeconds: 60,      // Seconds a pending entry waits before it is flushed
 	}

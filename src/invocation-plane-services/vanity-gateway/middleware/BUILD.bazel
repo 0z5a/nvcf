@@ -3,17 +3,21 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "middleware",
     srcs = [
+        "client_metrics.go",
         "host.go",
         "logging.go",
         "metrics.go",
         "middleware.go",
         "processing.go",
+        "request_id.go",
         "shadow_guard.go",
     ],
     importpath = "ai-api-gateway-service/middleware",
     visibility = ["//visibility:public"],
     deps = [
         "@com_github_go_chi_chi_v5//:chi",
+        "@com_github_go_chi_chi_v5//middleware",
+        "@com_github_google_uuid//:uuid",
         "@io_opentelemetry_go_contrib_instrumentation_net_http_otelhttp//:otelhttp",
         "@io_opentelemetry_go_otel//:otel",
         "@io_opentelemetry_go_otel//attribute",
@@ -34,6 +38,7 @@ alias(
 go_test(
     name = "middleware_test",
     srcs = [
+        "client_metrics_test.go",
         "logging_test.go",
         "metrics_test.go",
         "processing_test.go",

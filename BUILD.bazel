@@ -71,6 +71,19 @@ filegroup(
     visibility = ["//src/clis/nvcf-cli:__subpackages__"],
 )
 
+# NVCF docs that name LLM request-router algorithms. Stargate's routing-method
+# drift test compiles them in, so a stale or misspelled algorithm name fails
+# its tests. The stargate row in .github/workflows/bazel.yml also runs when
+# these files change.
+filegroup(
+    name = "stargate-routing-method-docs",
+    srcs = [
+        "docs/overview/llm-gateway.md",
+        "docs/self-managed/llm-request-router-load-balancing.md",
+    ],
+    visibility = ["//src/libraries/rust/stargate/crates/stargate:__pkg__"],
+)
+
 # Gazelle manages only the native Go subtrees listed in go.work.bazel.
 # nv-boot-parent and Cloud Tasks are also owned by the root Bazel module, but
 # their checked-in Java BUILD files are maintained manually and remain outside
@@ -105,6 +118,9 @@ filegroup(
 # gazelle:exclude src/compute-plane-services/image-credential-helper
 # gazelle:exclude src/compute-plane-services/nvca
 # gazelle:exclude src/compute-plane-services/nvcf-unbound
+# nvstor is Rust with hand-written BUILD files; its csi.proto is compiled by
+# Cargo (tonic-build), so Gazelle must not generate Go proto rules for it.
+# gazelle:exclude src/compute-plane-services/nvstor
 # gazelle:exclude src/compute-plane-services/worker-init
 # gazelle:exclude src/compute-plane-services/worker-llm-credentials
 # gazelle:exclude src/compute-plane-services/worker-task
@@ -121,5 +137,5 @@ filegroup(
 #   bazel run //:gazelle -- update-repos     - sync go.mod deps into MODULE.bazel
 gazelle(
     name = "gazelle",
-    prefix = "github.com/NVIDIA/nvcf",
+    prefix = "github.com/dsx-ai-factory/nvcf",
 )

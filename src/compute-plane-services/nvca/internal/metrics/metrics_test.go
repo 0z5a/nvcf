@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"testing"
 
-	translatecommon "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	translatecommon "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 	"github.com/prometheus/client_golang/prometheus"
 	promdto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -31,11 +31,11 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/clustervalidator"
-	metricsgctypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/gctypes"
-	modelcachetypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/modelcachetypes"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/workloadtypes"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/clustervalidator"
+	metricsgctypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/gctypes"
+	modelcachetypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/modelcachetypes"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/workloadtypes"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 func TestMetricsLifecycle(t *testing.T) {
@@ -1208,6 +1208,62 @@ func TestMaintenanceModeStateMetric(t *testing.T) {
 		assert.Equal(t, float64(1), values[types.MaintenanceModeNone.String()])
 		assert.Equal(t, float64(0), values[types.MaintenanceModeCordonAndDrain.String()])
 		assert.Equal(t, float64(0), values[types.MaintenanceModeCordon.String()])
+	})
+}
+
+// TestBYOOPlatformMetricsFederationStateMetric tests the federation check
+// gauge: every state series exists from startup, starting at not_checked, and
+// exactly one state is 1 (one-hot encoding).
+func TestBYOOPlatformMetricsFederationStateMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	ctx := WithDefaultMetrics(context.Background(), "nca-123", "test-cluster", "test-group", "v1.0.0",
+		WithRegisterer(reg))
+	metrics := FromContext(ctx)
+	t.Cleanup(func() { metrics.Destroy() })
+	require.NotNil(t, metrics)
+
+	stateValues := func() map[string]float64 {
+		metricFamilies, err := reg.Gather()
+		require.NoError(t, err)
+		out := map[string]float64{}
+		for _, mf := range metricFamilies {
+			if *mf.Name != BYOOPlatformMetricsFederationStateMetricName {
+				continue
+			}
+			for _, metric := range mf.Metric {
+				for _, lp := range metric.Label {
+					if *lp.Name == BYOOPlatformMetricsFederationStateLabel {
+						out[*lp.Value] = *metric.Gauge.Value
+					}
+				}
+			}
+		}
+		return out
+	}
+
+	assert.Equal(t, map[string]float64{
+		string(BYOOPlatformMetricsFederationNotChecked):  1,
+		string(BYOOPlatformMetricsFederationReachable):   0,
+		string(BYOOPlatformMetricsFederationUnreachable): 0,
+	}, stateValues(), "every state series should exist on the first scrape, starting at not_checked")
+
+	metrics.SetBYOOPlatformMetricsFederationState(BYOOPlatformMetricsFederationUnreachable)
+	assert.Equal(t, map[string]float64{
+		string(BYOOPlatformMetricsFederationNotChecked):  0,
+		string(BYOOPlatformMetricsFederationReachable):   0,
+		string(BYOOPlatformMetricsFederationUnreachable): 1,
+	}, stateValues())
+
+	metrics.SetBYOOPlatformMetricsFederationState(BYOOPlatformMetricsFederationReachable)
+	assert.Equal(t, map[string]float64{
+		string(BYOOPlatformMetricsFederationNotChecked):  0,
+		string(BYOOPlatformMetricsFederationReachable):   1,
+		string(BYOOPlatformMetricsFederationUnreachable): 0,
+	}, stateValues())
+
+	var nilMetrics *Metrics
+	assert.NotPanics(t, func() {
+		nilMetrics.SetBYOOPlatformMetricsFederationState(BYOOPlatformMetricsFederationReachable)
 	})
 }
 

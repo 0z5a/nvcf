@@ -22,18 +22,13 @@ import (
 
 	echo "github.com/labstack/echo/v4"
 
-	golibversion "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
+	golibversion "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 )
 
 func RegisterRoutes(e *echo.Echo, handlers *Handlers) {
-	originalErrorHandler := e.HTTPErrorHandler
-	e.HTTPErrorHandler = func(err error, c echo.Context) {
-		if c.Request().URL.Path == messagesEndpointPath {
-			messagesHTTPErrorHandler(err, c)
-			return
-		}
-		originalErrorHandler(err, c)
-	}
+	e.HTTPErrorHandler = newHTTPErrorHandler(
+		handlers.config != nil && handlers.config.ExposeRouterErrorCodes,
+	)
 	e.GET("/healthz", func(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	})
