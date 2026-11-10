@@ -1468,7 +1468,7 @@ func requestReadFailure(protocol nativeProtocol, err error) (int, string, string
 	}
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
-		status, kind, message = http.StatusRequestEntityTooLarge, "", "request body is too large"
+		status, kind, message = http.StatusRequestEntityTooLarge, "", fmt.Sprintf("request body is too large (limit %d bytes)", maxBytesErr.Limit)
 	}
 	if errors.Is(err, errModelFieldMissing) {
 		kind, message = errKindInvalidRequest, "model field is required"

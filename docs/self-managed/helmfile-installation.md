@@ -1130,6 +1130,30 @@ By default, the route host is `vanity.<domain>` and the backend is
 hosts, use the route hostname overrides supported by your stack package and
 create matching DNS records.
 
+Model API request bodies default to 25 MiB (26214400 bytes). Set
+`addons.vanityGateway.config.maxRequestSizeBytes` to a positive integer in
+bytes to change the limit. For example, allow 64 MiB:
+
+```yaml
+addons:
+  vanityGateway:
+    enabled: true
+    config:
+      maxRequestSizeBytes: 67108864
+```
+
+The gateway buffers full request bodies, and shadow requests add body copies.
+When raising this limit, raise `addons.vanityGateway.resources.limits.memory`
+to allow for concurrent requests and shadow models. The chart's default memory
+limit is `512Mi`.
+
+The stack passes this value to the chart's
+`vanityGateway.config.maxRequestSizeBytes`, which sets the service environment
+variable `MAX_REQUEST_SIZE_BYTES`. Invalid or non-positive values are rejected.
+The limit covers model API POST routes, including image endpoints. Generic
+vanity pass-through routes and private-model lookup response limits are unchanged.
+Restart the gateway after changing its environment configuration.
+
 After confirming your stack package includes the `vanity-gateway` release,
 preview and apply the service plus gateway routes:
 
