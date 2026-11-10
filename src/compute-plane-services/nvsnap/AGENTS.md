@@ -61,6 +61,9 @@ Every such change keeps these. Cite them by number in reviews.
 
 - Write the failing test first. The pull request shows it failing on the
   code before the change.
+- Test the wiring, not only the helper. Show each test fails when its
+  production call site is removed or reordered, and that a concurrency test
+  fails without the lock, claim or precondition it is meant to prove.
 - When a change alters what counts as an instance or a member, or the order
   of capture or restore steps, update the design doc under `docs/design/`
   first and get it reviewed.
