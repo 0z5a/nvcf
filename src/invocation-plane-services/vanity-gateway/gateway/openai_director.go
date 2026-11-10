@@ -87,8 +87,8 @@ type ModelDirector struct {
 	shadowBodyRewriter func(body []byte, modelName string) ([]byte, error)
 
 	// requestBodyLimit is the route body limit. A request whose declared
-	// Content-Length exceeds it keeps the buffered path so the limit error is
-	// returned before any byte is forwarded. Zero means unknown.
+	// Content-Length exceeds it is rejected before any body byte is read.
+	// Shadow replays are exempt. Zero means unknown.
 	requestBodyLimit int64
 
 	// Private models are listed only for callers whose API key may access the

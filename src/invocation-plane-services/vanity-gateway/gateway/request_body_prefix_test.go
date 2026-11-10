@@ -772,6 +772,52 @@ func TestFallbackPathsStillReceiveCompleteBodies(t *testing.T) {
 	})
 }
 
+// TestShadowReplayLongerThanRouteLimitReachesTarget sends a primary request
+// within the route limit whose shadow copy grows past it when its model is
+// rewritten, because the rewrite escapes HTML characters. Shadow replays never
+// pass through the route limit, so the copy must still reach its target.
+func TestShadowReplayLongerThanRouteLimitReachesTarget(t *testing.T) {
+	const limit = 4 * requestPrefixLimit
+	type received struct {
+		model string
+		size  int
+	}
+	requests := make(chan received, 2)
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := stdjson.Unmarshal(body, &payload); err != nil {
+			return nil, err
+		}
+		requests <- received{model: payload.Model, size: len(body)}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+	})
+	_, handler := newPrefixTestDirector(t, limit, transport)
+
+	head := `{"model":"acme/shadowed","stream":false,"input":"`
+	body := head + strings.Repeat("<", limit-len(head)-2) + `"}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	sizes := map[string]int{}
+	for range 2 {
+		select {
+		case got := <-requests:
+			sizes[got.model] = got.size
+		case <-time.After(5 * time.Second):
+			t.Fatalf("primary or shadow request missing, received %v", sizes)
+		}
+	}
+	assert.Equal(t, len(body), sizes["acme/shadowed"])
+	assert.Greater(t, sizes[prefixTestModel], limit, "the shadow copy must be longer than the route limit")
+}
+
 func TestPrefixReplayBodyCloseDuringRead(t *testing.T) {
 	for range 100 {
 		prefix := bytebufferpool.Get()

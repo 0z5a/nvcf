@@ -118,9 +118,11 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 		_, err := readOpenAIRequestBody(request, "json body")
 		return openAIRequestBody{}, requestBodyMode{}, err
 	}
-	if d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit {
+	if d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit && !isShadowRequest(request) {
 		// The body cannot fit the route limit, so fail as reading it would,
-		// without reading or forwarding any of it.
+		// without reading or forwarding any of it. Shadow replays are exempt:
+		// they never pass through the route limit, and rewriting their model
+		// can make them longer than the primary request.
 		_ = request.Body.Close()
 		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
 	}
