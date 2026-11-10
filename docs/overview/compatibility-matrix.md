@@ -13,24 +13,21 @@ to a maintained train before moving further.
 
 | Stack | Latest release | Source tag |
 | --- | --- | --- |
-| [Self-managed (control plane)](../self-managed/installation.md) | `1.0.1` | `deploy/stacks/self-managed/v1.0.1` |
-| [Compute plane](../compute-plane/cluster-management/index.md) | `1.0.0` | `deploy/stacks/nvcf-compute-plane/v1.0.0` |
-| [Observability](../observability/observability.md) | `1.0.0` | `deploy/stacks/observability/v1.0.0` |
+| [Self-managed (control plane)](../self-managed/installation.md) | `1.1.5` | `deploy/stacks/self-managed/v1.1.5` |
+| [Compute plane](../compute-plane/cluster-management/index.md) | `1.1.0` | `deploy/stacks/nvcf-compute-plane/v1.1.0` |
+| [Observability](../observability/observability.md) | `1.1.0` | `deploy/stacks/observability/v1.1.0` |
 
 ## Compatible stack versions
 
 | Stack | Release | Works with |
 | --- | --- | --- |
-| Self-managed (control plane) | `1.1.0` | Compute plane `1.0.0` or later, Observability `1.0.0` or later |
-| Self-managed (control plane) | `1.0.1` | Compute plane `1.0.0` or later, Observability `1.0.0` or later |
-| Self-managed (control plane) | `1.0.0` | Compute plane `1.0.0` or later, Observability `1.0.0` or later |
-| Compute plane | `1.1.0` | Self-managed (control plane) `1.1.0` or later, Observability `1.0.0` or later |
-| Compute plane | `1.0.0` | Self-managed (control plane) `1.0.0` or later, Observability `1.0.0` or later |
-| Observability | `1.0.0` | Self-managed (control plane) `1.0.0` or later, Compute plane `1.0.0` or later |
+| Self-managed (control plane) | `1.1.5` | Compute plane `1.1.0` only, Observability `1.1.0` only |
+| Compute plane | `1.1.0` | Self-managed (control plane) `1.1.5` only, Observability `1.1.0` only |
+| Observability | `1.1.0` | Self-managed (control plane) `1.1.5` only, Compute plane `1.1.0` only |
 
 {/*docs-version-sync:END compatibility-matrix*/}
 
 The tables show the stack versions documented by the selected release.
 
 For the upgrade path from NVCF 1.0.x, see its
-[cross-stack upgrade order](release-notes/1.0.x-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
+[cross-stack upgrade order](release-notes/1.0.1-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
