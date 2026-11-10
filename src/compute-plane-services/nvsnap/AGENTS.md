@@ -6,6 +6,8 @@ content hygiene.
 
 ## Build and test
 
+From `src/compute-plane-services/nvsnap`:
+
 ```bash
 go build ./...
 make test
@@ -52,8 +54,10 @@ Every such change keeps these. Cite them by number in reviews.
 5. Fail closed. When the agent cannot decide (an API read fails, a member is
    missing, a count is unknown), the pod starts cold. A cold start is slow; a
    wrong restore is an outage.
-6. Restored means serving. A restore is verified by the restored engine
-   answering requests and keeping its leases, not by the restore returning.
+6. Restored means serving. A restore returning does not prove it. The
+   agent's automatic check after a capture only watches the restored pods
+   stay ready; release validation (below) checks that the restored engine
+   answers requests and keeps its leases.
 7. Every hold, freeze, lock and claim is released or expires on every path:
    success, abort, timeout, cancellation and agent restart.
 
