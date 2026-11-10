@@ -57,6 +57,20 @@ class ImageMoveChecks(unittest.TestCase):
         self.assertIn("BACKWARD nats-server: running 2.14.9-alpine3.22, the render pulls "
                       "2.14.6-alpine3.22", result.stdout)
 
+    def test_the_109_nats_pins_remove_both_backward_moves(self):
+        self.write_before(("nats", "docker.io/synadia/nats-server:2.14.9-alpine3.22"),
+                          ("reloader", "docker.io/natsio/nats-server-config-reloader:0.25.0"))
+        self.write_render("docker.io/synadia/nats-server:2.14.6-alpine3.22",
+                          "docker.io/natsio/nats-server-config-reloader:0.24.0")
+        result = self.run_script("compare", str(self.before), str(self.render))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.count("BACKWARD"), 2)
+        self.assertIn("Self-Managed 1.0.9: keep the NATS images", result.stderr)
+        self.write_render("docker.io/synadia/nats-server:2.14.9-alpine3.22",
+                          "docker.io/natsio/nats-server-config-reloader:0.25.0")
+        result = self.run_script("compare", str(self.before), str(self.render))
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_flavoured_tags_compare_by_every_number(self):
         self.write_before(("openbao", "nvcr.io/nvidia/nvcf/nvcf-openbao:2.6.3-nv-1.3.9"))
         self.write_render("nvcr.io/nvidia/nvcf/nvcf-openbao:2.6.3-nv-1.3.7")
