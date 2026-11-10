@@ -432,9 +432,11 @@ reads at most 64 KiB of a JSON body before it decides how to read the rest.
 
 ```mermaid
 flowchart TD
-  request[Model API request] --> pre{Multipart, or Content-Length over the route limit?}
-  pre -- yes --> buffered[Buffered path: read the whole body, validate, route, forward]
-  pre -- no --> prefix[Read up to 64 KiB]
+  request[Model API request] --> limit{Content-Length over the route limit?}
+  limit -- yes --> rejected[Reject before reading the body]
+  limit -- no --> multipart{Multipart?}
+  multipart -- yes --> buffered[Buffered path: read the whole body, validate, route, forward]
+  multipart -- no --> prefix[Read up to 64 KiB]
   prefix --> ended{Body ended?}
   ended -- yes --> buffered
   ended -- no --> fields{Routing fields in the prefix, and the route forwards the body unchanged?}
@@ -443,7 +445,7 @@ flowchart TD
 ```
 
 - Buffered path: the gateway reads the complete body, decodes and validates it,
-  and then forwards it. Every body that ends within 64 KiB uses this path, so
+  and then forwards it. Every body shorter than 64 KiB uses this path, so
   small requests are validated exactly as before.
 - Streamed path: the gateway retains only the 64 KiB prefix, releases it once
   forwarded, and applies backpressure from the upstream to the client upload.
@@ -478,13 +480,14 @@ The buffered path is also used when:
 | A routing field uses a form listed above | `nonstandard_fields` |
 | The prefix is not a JSON object or has a syntax error | `invalid_prefix` |
 | `multipart/form-data` image requests | `multipart` |
-| `Content-Length` exceeds the route limit | `content_length_over_limit` |
 | The model is not routed by the endpoint | `model_not_found` |
 | The model is offline or past `eol` | `function_status` |
 | `functionType: LLM`, which rewrites `model` in the body | `llm_gateway` |
 | The model has shadow targets | `shadow` |
 
 The buffered cases keep their existing error responses and error precedence.
+A request whose `Content-Length` exceeds the route limit gets the same
+too-large error as before, without the gateway reading its body first.
 For `functionType: LLM`, the LLM Gateway also buffers the rewritten body, so
 those requests are not expected to use less memory.
 
@@ -501,8 +504,8 @@ Failures after a streamed request is dispatched:
   native routes. The upstream receives an incomplete body, never a complete
   truncated one.
 - If the client disconnects or the upload fails, the upstream request is
-  aborted with an incomplete body. The gateway records `client_canceled` or
-  `gateway_proxy_error`.
+  aborted with an incomplete body and the gateway records `client_canceled`
+  (`499`), as for a disconnect before dispatch.
 - If the upstream has already started its response, the failure ends that
   response.
 - If the upstream answers before reading the whole body, the client receives

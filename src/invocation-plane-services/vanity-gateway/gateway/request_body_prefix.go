@@ -75,8 +75,6 @@ const (
 	requestBodyReasonInvalidPrefix = "invalid_prefix"
 	// Buffered: multipart image requests are always read in full.
 	requestBodyReasonMultipart = "multipart"
-	// Buffered: Content-Length declares more than the route limit.
-	requestBodyReasonOverLimit = "content_length_over_limit"
 	// Buffered: the model is not routed by this endpoint.
 	requestBodyReasonModelNotFound = "model_not_found"
 	// Buffered: the route is offline or past end of life.
@@ -120,7 +118,10 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 		return openAIRequestBody{}, requestBodyMode{}, err
 	}
 	if d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit {
-		return finishBufferedRequestBody(request, bytebufferpool.Get(), decode, requestBodyReasonOverLimit)
+		// The body cannot fit the route limit, so fail as reading it would,
+		// without reading or forwarding any of it.
+		_ = request.Body.Close()
+		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
 	}
 
 	prefix := bytebufferpool.Get()
@@ -148,8 +149,9 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 // readRequestPrefix fills prefix with up to requestPrefixLimit bytes of body.
 // complete reports that the body ended within the prefix. Only io.EOF ends the
 // body; any other error, including io.ErrUnexpectedEOF from a truncated
-// upload, is returned. A known Content-Length sizes the buffer so the end of a
-// small body is seen without growing it.
+// upload, is returned. A known Content-Length sizes the buffer and marks the
+// body complete once that many bytes are read, including a body of exactly
+// requestPrefixLimit bytes.
 func readRequestPrefix(prefix *bytebufferpool.ByteBuffer, body io.Reader, contentLength int64) (bool, error) {
 	prefix.B = prefix.B[:0]
 	for len(prefix.B) < requestPrefixLimit {
@@ -163,7 +165,7 @@ func readRequestPrefix(prefix *bytebufferpool.ByteBuffer, body io.Reader, conten
 		end := min(cap(prefix.B), requestPrefixLimit)
 		n, err := body.Read(prefix.B[len(prefix.B):end])
 		prefix.B = prefix.B[:len(prefix.B)+n]
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, io.EOF) || (err == nil && int64(len(prefix.B)) == contentLength) {
 			return true, nil
 		}
 		if err != nil {
@@ -482,7 +484,26 @@ func (b *prefixReplayBody) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	b.mu.Unlock()
-	return b.rest.Read(p)
+	n, err := b.rest.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = &clientBodyReadError{err: err}
+	}
+	return n, err
+}
+
+// clientBodyReadError marks a failure to read the client upload after a
+// streamed request was dispatched, so the proxy error handler attributes it
+// to the client rather than to the upstream.
+type clientBodyReadError struct {
+	err error
+}
+
+func (e *clientBodyReadError) Error() string {
+	return "read client request body: " + e.err.Error()
+}
+
+func (e *clientBodyReadError) Unwrap() error {
+	return e.err
 }
 
 func (b *prefixReplayBody) Close() error {
@@ -518,7 +539,6 @@ var requestBodyModes = []requestBodyMode{
 	bufferedBodyRead(requestBodyReasonNonstandardFields),
 	bufferedBodyRead(requestBodyReasonInvalidPrefix),
 	bufferedBodyRead(requestBodyReasonMultipart),
-	bufferedBodyRead(requestBodyReasonOverLimit),
 	bufferedBodyRead(requestBodyReasonModelNotFound),
 	bufferedBodyRead(requestBodyReasonFunctionStatus),
 	bufferedBodyRead(requestBodyReasonLLMGateway),

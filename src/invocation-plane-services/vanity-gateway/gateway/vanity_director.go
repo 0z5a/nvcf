@@ -146,35 +146,45 @@ func requestProxy(base *httputil.ReverseProxy, request *http.Request, proxyErr *
 	return &rp
 }
 
-// writeProxyError maps a canceled inbound request to 499; all other ReverseProxy
-// ErrorHandler failures remain 502.
+// writeProxyError maps a canceled inbound request, or a streamed client
+// upload that fails after dispatch, to 499, and a body over the route limit
+// to the same error as before dispatch. All other ReverseProxy ErrorHandler
+// failures remain 502.
 func writeProxyError(writer http.ResponseWriter, request *http.Request, err error) {
-	if clientClosedRequest(request) {
-		addGatewayProxyOutcome(request, middleware.GatewayProxyOutcomeClientCanceled)
-		writer.Header().Set(middleware.ErrorSourceHeader, string(middleware.GatewayProxyOutcomeClientCanceled))
-		zap.L().Debug("proxy request canceled",
-			zap.String(string(middleware.GatewayProxyOutcomeMetricAttribute), string(middleware.GatewayProxyOutcomeClientCanceled)),
-			zap.Error(err),
-		)
-		if writeProtocolError(writer, proxyErrorProtocol(request), statusClientClosedRequest, "", "client closed the request") {
-			return
-		}
-		writer.Header().Set("Content-Type", "application/problem+json")
-		writer.WriteHeader(statusClientClosedRequest)
-		_ = json.NewEncoder(writer).Encode(ProblemDetails{
-			Type:   "about:blank",
-			Title:  "Client Closed Request",
-			Status: statusClientClosedRequest,
-			Detail: "Client closed the request before a response was produced.",
-		})
-		return
-	}
 	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
+	var bodyErr *clientBodyReadError
+	switch {
+	case clientClosedRequest(request):
+		writeClientClosedRequest(writer, request, err)
+	case errors.As(err, &maxBytesErr):
 		writeRequestTooLargeAfterDispatch(writer, request, maxBytesErr)
+	case errors.As(err, &bodyErr):
+		// A streamed upload that fails after dispatch is a client failure,
+		// as it was when the body was read before dispatch.
+		writeClientClosedRequest(writer, request, err)
+	default:
+		writeBadGatewayProblem(writer, request, err)
+	}
+}
+
+func writeClientClosedRequest(writer http.ResponseWriter, request *http.Request, err error) {
+	addGatewayProxyOutcome(request, middleware.GatewayProxyOutcomeClientCanceled)
+	writer.Header().Set(middleware.ErrorSourceHeader, string(middleware.GatewayProxyOutcomeClientCanceled))
+	zap.L().Debug("proxy request canceled",
+		zap.String(string(middleware.GatewayProxyOutcomeMetricAttribute), string(middleware.GatewayProxyOutcomeClientCanceled)),
+		zap.Error(err),
+	)
+	if writeProtocolError(writer, proxyErrorProtocol(request), statusClientClosedRequest, "", "client closed the request") {
 		return
 	}
-	writeBadGatewayProblem(writer, request, err)
+	writer.Header().Set("Content-Type", "application/problem+json")
+	writer.WriteHeader(statusClientClosedRequest)
+	_ = json.NewEncoder(writer).Encode(ProblemDetails{
+		Type:   "about:blank",
+		Title:  "Client Closed Request",
+		Status: statusClientClosedRequest,
+		Detail: "Client closed the request before a response was produced.",
+	})
 }
 
 // writeRequestTooLargeAfterDispatch answers a streamed model request whose
@@ -184,10 +194,13 @@ func writeProxyError(writer http.ResponseWriter, request *http.Request, err erro
 // complete one.
 func writeRequestTooLargeAfterDispatch(writer http.ResponseWriter, request *http.Request, maxBytesErr *http.MaxBytesError) {
 	markGatewayRejected(writer, request)
-	zap.L().Debug("request body exceeded limit after dispatch",
-		append(middleware.TraceFields(request.Context()), zap.Int64("limit_bytes", maxBytesErr.Limit))...,
-	)
-	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+	zap.L().Debug("request body exceeded limit after dispatch", append(
+		middleware.TraceFields(request.Context()),
+		zap.String("request_id", request.Header.Get(middleware.RequestIDHeader)),
+		zap.String("function_id", request.Header.Get("function-id")),
+		zap.Int64("limit_bytes", maxBytesErr.Limit),
+	)...)
+	if protocol := proxyErrorProtocol(request); protocol != nativeProtocolNone {
 		status, kind, message := requestReadFailure(protocol, maxBytesErr)
 		writeNativeError(writer, request, status, kind, message)
 		return

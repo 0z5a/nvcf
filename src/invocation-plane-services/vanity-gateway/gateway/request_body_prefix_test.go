@@ -146,6 +146,7 @@ func TestReadModelRequestBodyChoosesPath(t *testing.T) {
 		{"messages route", "/v1/messages", "application/json", earlyBody(`{"model":"`+prefixTestModel+`","stream":true`, large), streamedBodyRead(), prefixTestModel, true},
 
 		{"complete small body", "/v1/chat/completions", "", `{"model":"` + prefixTestModel + `","stream":true}`, bufferedBodyRead(requestBodyReasonComplete), prefixTestModel, true},
+		{"known length of exactly the prefix", "/v1/chat/completions", "", exactPrefixBody(), bufferedBodyRead(requestBodyReasonComplete), prefixTestModel, true},
 		{"absent stream", "/v1/chat/completions", "", earlyBody(`{"model":"`+prefixTestModel+`"`, large), bufferedBodyRead(requestBodyReasonLateFields), prefixTestModel, false},
 		{"late model", "/v1/chat/completions", "", `{"input":"` + filler(large) + `","model":"` + prefixTestModel + `","stream":true}`, bufferedBodyRead(requestBodyReasonLateFields), prefixTestModel, true},
 		{"escaped key", "/v1/chat/completions", "", earlyBody(`{"mod\u0065l":"`+prefixTestModel+`","stream":true`, large), bufferedBodyRead(requestBodyReasonNonstandardFields), prefixTestModel, true},
@@ -183,6 +184,13 @@ func TestReadModelRequestBodyChoosesPath(t *testing.T) {
 			assert.Equal(t, tc.body, string(forwarded), "the forwarded bytes must equal the client bytes")
 		})
 	}
+}
+
+// exactPrefixBody is a valid early-field body of exactly requestPrefixLimit
+// bytes.
+func exactPrefixBody() string {
+	head := `{"model":"` + prefixTestModel + `","stream":true,"input":"`
+	return head + filler(requestPrefixLimit-len(head)-2) + `"}`
 }
 
 func largeMultipartModelBody(t *testing.T, model string, fileSize int) (string, string) {
@@ -245,15 +253,60 @@ func TestReadModelRequestBodyDoesNotValidateAfterRouting(t *testing.T) {
 	require.ErrorIs(t, err, errInvalidJSONBody, "the buffered path rejects the same body before dispatch")
 }
 
-func TestReadModelRequestBodyOverLimitStaysBuffered(t *testing.T) {
+// TestReadModelRequestBodyRejectsDeclaredOverLimitWithoutReading checks that
+// a Content-Length over the route limit fails with the limit error before any
+// body byte is read.
+func TestReadModelRequestBodyRejectsDeclaredOverLimitWithoutReading(t *testing.T) {
 	director, _ := newPrefixTestDirector(t, 1<<20, http.DefaultTransport)
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(earlyBody(`{"model":"`+prefixTestModel+`","stream":true`, 1<<20)))
-	req.Body = http.MaxBytesReader(httptest.NewRecorder(), req.Body, 1<<20)
+	client := newGatedBody(earlyBody(`{"model":"`+prefixTestModel+`","stream":true`, 1<<20), "")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", client)
+	req.ContentLength = 1<<20 + 1
 	_, mode, err := director.readModelRequestBody(req, director.chatCompletions.modelNameToNVCFUrl)
 	var maxBytesErr *http.MaxBytesError
 	require.ErrorAs(t, err, &maxBytesErr)
+	assert.Equal(t, int64(1<<20), maxBytesErr.Limit)
 	assert.Equal(t, requestBodyMode{}, mode)
-	assert.Greater(t, req.ContentLength, director.requestBodyLimit)
+	assert.Zero(t, client.read.Load(), "no body byte may be read")
+	assert.True(t, client.closed.Load(), "the body must be closed")
+}
+
+// TestStreamedRequestClientUploadFailureIsClientCanceled fails the client
+// upload after a streamed request was dispatched through a real transport.
+// The gateway must attribute it to the client, as a read failure before
+// dispatch was, not report an upstream proxy error.
+func TestStreamedRequestClientUploadFailureIsClientCanceled(t *testing.T) {
+	upstreamErr := make(chan error, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.Copy(io.Discard, r.Body)
+		upstreamErr <- err
+	}))
+	t.Cleanup(backend.Close)
+	vanity, err := NewVanityDirector(backend.URL, &http.Transport{})
+	require.NoError(t, err)
+	director, err := NewModelDirector(directMappings(), regexp.MustCompile("^$"), vanity, nil, nil)
+	require.NoError(t, err)
+
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		t.Run(path, func(t *testing.T) {
+			head := `{"model":"` + prefixTestModel + `","stream":false,"input":"` + filler(2*requestPrefixLimit)
+			req := httptest.NewRequest(http.MethodPost, path, io.MultiReader(strings.NewReader(head), iotestErrReader{io.ErrUnexpectedEOF}))
+			req.ContentLength = -1
+			rec := httptest.NewRecorder()
+			if path == "/v1/messages" {
+				director.ServeMessages(rec, req)
+			} else {
+				director.ServeChatCompletions(rec, req)
+			}
+			assert.Equal(t, statusClientClosedRequest, rec.Code)
+			assert.Equal(t, "client_canceled", rec.Header().Get("NVCF-Error-Source"))
+			select {
+			case err := <-upstreamErr:
+				assert.Error(t, err, "the upstream must see an incomplete body")
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream handler did not finish")
+			}
+		})
+	}
 }
 
 // FuzzScanRequestPrefix checks that whenever the scanner resolves routing
