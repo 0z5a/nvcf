@@ -474,6 +474,86 @@ func TestIsTimeSincePodLaunchedLaterThan(t *testing.T) {
 	}
 }
 
+func TestPodLaunchTime(t *testing.T) {
+	started := metav1.NewTime(time.Date(2026, 11, 6, 23, 0, 0, 0, time.UTC))
+	unscheduledSince := metav1.NewTime(started.Add(time.Minute))
+	created := metav1.NewTime(started.Add(-time.Minute))
+
+	tests := []struct {
+		name   string
+		pod    *corev1.Pod
+		want   metav1.Time
+		wantOK bool
+	}{
+		{
+			name: "start time wins over the scheduled condition",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+				Status: corev1.PodStatus{
+					StartTime: &started,
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			want:   started,
+			wantOK: true,
+		},
+		{
+			name: "unscheduled pod uses the condition transition time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			want:   unscheduledSince,
+			wantOK: true,
+		},
+		{
+			name: "scheduled pod without a start time has no launch time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionTrue,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			wantOK: false,
+		},
+		{
+			name: "pod without a scheduled condition uses its creation time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+			},
+			want:   created,
+			wantOK: true,
+		},
+		{
+			name:   "empty pod has no launch time",
+			pod:    &corev1.Pod{},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := PodLaunchTime(tt.pod)
+			require.Equal(t, tt.wantOK, ok)
+			assert.True(t, tt.want.Equal(&got), "got %s, want %s", got, tt.want)
+		})
+	}
+}
+
 func TestIsPodDegraded(t *testing.T) {
 	now := time.Now()
 	tests := []struct {

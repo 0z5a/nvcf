@@ -153,3 +153,65 @@ func TestDoStatus_WorkerTerminalBadStateForImagePullBackOff(t *testing.T) {
 		assert.Equal(t, "WorkerTerminalBadState", cond.Reason)
 	}
 }
+
+// TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline checks that a status
+// check that finds an unscheduled pod requeues for that pod's own scheduling
+// deadline. A pod that becomes unschedulable just after the previous check would
+// otherwise be judged stuck one full scheduling timeout late.
+func TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline(t *testing.T) {
+	const ns = "test-requeue-ns"
+	timeConfig := (&nvcak8sutil.TimeConfig{}).Complete()
+	schedulingTimeout := timeConfig.PodScheduledThreshold
+	untilDeadline := 30 * time.Second
+
+	ctx := newTestContext()
+	utilsPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: common.UtilsPodName, Namespace: ns},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: common.UtilsContainerName}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:               corev1.PodScheduled,
+				Status:             corev1.ConditionFalse,
+				Reason:             corev1.PodReasonUnschedulable,
+				LastTransitionTime: metav1.NewTime(time.Now().Add(-schedulingTimeout + untilDeadline)),
+			}},
+		},
+	}
+	ms := &v1alpha1.MiniService{
+		ObjectMeta: metav1.ObjectMeta{Name: "requeue-test-ms", UID: "requeue-test-uid"},
+		Spec:       v1alpha1.MiniServiceSpec{Namespace: ns, ICMSRequestName: "requeue-test-icms"},
+	}
+	icmsReq := &nvcav2beta1.ICMSRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "requeue-test-icms", Namespace: "nvcf-backend"},
+		Spec:       nvcav2beta1.ICMSRequestSpec{Action: common.RequestICMSInstances},
+	}
+
+	c, _ := newFakeClient(mgrScheme,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}},
+		utilsPod,
+	)
+	cache := chartcache.New(t.TempDir())
+	require.NoError(t, cache.Start(ctx))
+
+	r := &Reconciler{
+		ControllerOptions:     ControllerOptions{K8sTimeConfig: timeConfig},
+		Client:                c,
+		Decoder:               serializer.NewCodecFactory(mgrScheme).UniversalDeserializer(),
+		chartCache:            cache,
+		newPermissionsChecker: newFakePermissionsChecker,
+		now:                   time.Now,
+	}
+	require.NoError(t, r.saveRenderedData(ctx, ms, []byte("[]")))
+
+	res, err := r.doStatus(ctx, ms, icmsReq)
+	require.NoError(t, err)
+
+	cond := meta.FindStatusCondition(ms.Status.Conditions, v1alpha1.MiniServiceConditionObjectsHealthy)
+	require.NotNil(t, cond)
+	assert.Equal(t, v1alpha1.MiniServiceStatusReasonWaitingObjectReadiness, cond.Reason)
+	// The stored transition time is truncated to whole seconds, so the
+	// deadline can be up to a second earlier than requested.
+	assert.Greater(t, res.RequeueAfter, untilDeadline-2*time.Second)
+	assert.LessOrEqual(t, res.RequeueAfter, untilDeadline+podSchedulingRequeueSlack)
+}
