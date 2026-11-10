@@ -86,6 +86,11 @@ type ModelDirector struct {
 	shadowRandomBucket func() int
 	shadowBodyRewriter func(body []byte, modelName string) ([]byte, error)
 
+	// requestBodyLimit is the route body limit. A request whose declared
+	// Content-Length exceeds it keeps the buffered path so the limit error is
+	// returned before any byte is forwarded. Zero means unknown.
+	requestBodyLimit int64
+
 	// Private models are listed only for callers whose API key may access the
 	// function version they route to. privateModels is nil when private model
 	// listing is disabled.
@@ -806,19 +811,15 @@ func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, requ
 }
 
 func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (resolvedOpenAIRequest, bool) {
-	extract := extractOpenAIRequestBody
-	if isDecisionRoute(request) {
-		if !isDecisionContentType(request.Header.Get(contentTypeHeader)) {
-			if request.Body != nil {
-				_ = request.Body.Close()
-			}
-			markGatewayRejected(writer, request)
-			writeNativeError(writer, request, http.StatusUnsupportedMediaType, "", "Content-Type must be application/json")
-			return resolvedOpenAIRequest{}, true
+	if isDecisionRoute(request) && !isDecisionContentType(request.Header.Get(contentTypeHeader)) {
+		if request.Body != nil {
+			_ = request.Body.Close()
 		}
-		extract = extractDecisionRequestBody
+		markGatewayRejected(writer, request)
+		writeNativeError(writer, request, http.StatusUnsupportedMediaType, "", "Content-Type must be application/json")
+		return resolvedOpenAIRequest{}, true
 	}
-	body, err := extract(request)
+	body, bodyMode, err := d.readModelRequestBody(request, modelToNVCFUrl)
 	if err != nil {
 		markGatewayRejected(writer, request)
 		if protocol := requestProtocol(request); protocol != nativeProtocolNone {
@@ -828,19 +829,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 		}
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			// Handle the case where the body is too large
-			writer.WriteHeader(http.StatusBadRequest)
-			errorMessage := OpenAIError{
-				Error: CustomOpenAIError{
-					Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
-						"If larger assets are required please refer to our Assets API.", maxRequestSize),
-					Type: "invalid_request_error",
-					Code: "invalid_image_format",
-				},
-			}
-			if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
-				http.Error(writer, err.Error(), http.StatusInternalServerError)
-			}
+			writeOpenAIRequestTooLarge(writer, maxBytesErr)
 			return resolvedOpenAIRequest{}, true
 		}
 		if errors.Is(err, errInvalidJSONBody) {
@@ -869,6 +858,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 		traceAttrModelName.String(body.Model),
 		traceAttrModelStream.Bool(body.Stream),
 	)
+	recordRequestBodyMode(request, bodyMode)
 
 	nvcfUrl, ok := modelToNVCFUrl[body.Model]
 	if !ok {
@@ -1181,6 +1171,24 @@ func replaceTopLevelModel(body []byte, modelName string) ([]byte, error) {
 	return append(rewritten, body[last:]...), nil
 }
 
+// writeOpenAIRequestTooLarge writes the OpenAI-shaped response for a body
+// over the route limit. The forwarding path uses it too, when the limit is
+// reached after the request was dispatched but before any response.
+func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError) {
+	writer.WriteHeader(http.StatusBadRequest)
+	errorMessage := OpenAIError{
+		Error: CustomOpenAIError{
+			Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
+				"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit),
+			Type: "invalid_request_error",
+			Code: "invalid_image_format",
+		},
+	}
+	if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 // errModelFieldMissing signals that the client sent a valid request body that did
 // not contain a non-empty "model" field. Callers render this as HTTP 400 rather
 // than letting it fall through to a misleading 404 "model not found".
@@ -1297,6 +1305,12 @@ func extractDecisionRequestBody(request *http.Request) (openAIRequestBody, error
 	if err != nil {
 		return openAIRequestBody{}, err
 	}
+	return decodeDecisionRequestBody(bodyBytes)
+}
+
+// decodeDecisionRequestBody applies the decision route checks to a complete
+// buffered body and releases the buffer on error.
+func decodeDecisionRequestBody(bodyBytes *bufferedOpenAIRequestBody) (openAIRequestBody, error) {
 	if !stdjson.Valid(bodyBytes.peek()) {
 		_ = bodyBytes.Close()
 		return openAIRequestBody{}, errInvalidJSONBody
@@ -1326,14 +1340,19 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 	if err != nil {
 		return openAIRequestBody{}, err
 	}
+	return decodeOpenAIJSONBody(bodyBytes)
+}
 
+// decodeOpenAIJSONBody reads model and stream from a complete buffered body
+// and releases the buffer on error.
+func decodeOpenAIJSONBody(bodyBytes *bufferedOpenAIRequestBody) (openAIRequestBody, error) {
 	// A top-level null decodes without error, but the body must be a JSON object.
 	if bytes.Equal(bytes.TrimSpace(bodyBytes.peek()), []byte("null")) {
 		_ = bodyBytes.Close()
 		return openAIRequestBody{}, fmt.Errorf("%w: body is null", errInvalidJSONBody)
 	}
 	body := openAIRequestBody{}
-	err = json.UnmarshalWithOption(bodyBytes.peek(), &body, json.DecodeFieldPriorityFirstWin())
+	err := json.UnmarshalWithOption(bodyBytes.peek(), &body, json.DecodeFieldPriorityFirstWin())
 	if err != nil {
 		_ = bodyBytes.Close()
 		return openAIRequestBody{}, fmt.Errorf("%w: %w", errInvalidJSONBody, err)
@@ -1359,9 +1378,17 @@ func readOpenAIRequestBody(request *http.Request, bodyDescription string) (*buff
 		return nil, fmt.Errorf("expecting %s", bodyDescription)
 	}
 
-	bodyBytes := bytebufferpool.Get()
+	return bufferRemainingRequestBody(request, bytebufferpool.Get())
+}
+
+// bufferRemainingRequestBody appends the unread request body to bodyBytes,
+// which may already hold a prefix read from it, and replaces request.Body with
+// a reader over the complete body. The buffer is released on error or when the
+// returned body is closed.
+func bufferRemainingRequestBody(request *http.Request, bodyBytes *bytebufferpool.ByteBuffer) (*bufferedOpenAIRequestBody, error) {
+	// Put resets the buffer after recording its length; resetting first
+	// would calibrate the pool as if every body were empty.
 	releaseBuffer := sync.OnceFunc(func() {
-		bodyBytes.Reset()
 		bytebufferpool.Put(bodyBytes)
 	})
 	_, err := io.Copy(bodyBytes, request.Body)

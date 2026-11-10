@@ -169,7 +169,30 @@ func writeProxyError(writer http.ResponseWriter, request *http.Request, err erro
 		})
 		return
 	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeRequestTooLargeAfterDispatch(writer, request, maxBytesErr)
+		return
+	}
 	writeBadGatewayProblem(writer, request, err)
+}
+
+// writeRequestTooLargeAfterDispatch answers a streamed model request whose
+// body passed the route limit after forwarding began and before the upstream
+// responded. The response matches the one written when the limit is reached
+// before dispatch. The upstream sees an incomplete body, never a truncated
+// complete one.
+func writeRequestTooLargeAfterDispatch(writer http.ResponseWriter, request *http.Request, maxBytesErr *http.MaxBytesError) {
+	markGatewayRejected(writer, request)
+	zap.L().Debug("request body exceeded limit after dispatch",
+		append(middleware.TraceFields(request.Context()), zap.Int64("limit_bytes", maxBytesErr.Limit))...,
+	)
+	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+		status, kind, message := requestReadFailure(protocol, maxBytesErr)
+		writeNativeError(writer, request, status, kind, message)
+		return
+	}
+	writeOpenAIRequestTooLarge(writer, maxBytesErr)
 }
 
 func writeBadGatewayProblem(writer http.ResponseWriter, request *http.Request, err error) {
