@@ -71,7 +71,8 @@ const (
 	// decoder, such as an escaped or non-ASCII key, a null or non-string model,
 	// an escaped model value, or a non-boolean stream.
 	requestBodyReasonNonstandardFields = "nonstandard_fields"
-	// Buffered: the prefix is not a JSON object or has a syntax error.
+	// Buffered: the prefix is not a JSON object, has a syntax error, or nests
+	// deeper than the decoders accept.
 	requestBodyReasonInvalidPrefix = "invalid_prefix"
 	// Buffered: multipart image requests are always read in full.
 	requestBodyReasonMultipart = "multipart"
@@ -265,7 +266,7 @@ func (s *requestPrefixScan) scan(buf []byte) string {
 			return requestBodyReasonInvalidPrefix
 		}
 		valueStart := skipJSONSpace(buf, i+1)
-		valueEnd, complete := jsonValueEnd(buf, valueStart)
+		valueEnd, valueDepth, complete := jsonValueEnd(buf, valueStart)
 		if !complete {
 			return requestBodyReasonLateFields
 		}
@@ -279,7 +280,7 @@ func (s *requestPrefixScan) scan(buf []byte) string {
 			return requestBodyReasonInvalidPrefix
 		}
 		value := buf[valueStart:valueEnd]
-		if !stdjson.Valid(key) || !stdjson.Valid(value) {
+		if !stdjson.Valid(key) || !stdjson.Valid(value) || valueDepth >= jsonMaxDepth {
 			return requestBodyReasonInvalidPrefix
 		}
 		if reason := s.member(key, keyEscaped, value); reason != "" {
@@ -409,44 +410,52 @@ func jsonStringEnd(buf []byte, start int) (int, bool, bool) {
 	return 0, escaped, false
 }
 
-// jsonValueEnd returns the offset after the value that starts at buf[start].
-// It only locates the end; stdjson.Valid checks the syntax afterwards.
-func jsonValueEnd(buf []byte, start int) (int, bool) {
+// jsonMaxDepth is the nesting limit of the complete-body decoders,
+// encoding/json and goccy/go-json, for a whole document. The top-level object
+// is one level, so a member value nested jsonMaxDepth levels makes the
+// document too deep to decode.
+const jsonMaxDepth = 10000
+
+// jsonValueEnd returns the offset after the value that starts at buf[start]
+// and how many levels it nests. It only locates the end; stdjson.Valid checks
+// the syntax afterwards.
+func jsonValueEnd(buf []byte, start int) (int, int, bool) {
 	if start >= len(buf) {
-		return 0, false
+		return 0, 0, false
 	}
 	switch buf[start] {
 	case '"':
 		end, _, complete := jsonStringEnd(buf, start)
-		return end, complete
+		return end, 0, complete
 	case '{', '[':
-		depth := 0
+		depth, maxDepth := 0, 0
 		for i := start; i < len(buf); i++ {
 			switch buf[i] {
 			case '"':
 				end, _, complete := jsonStringEnd(buf, i)
 				if !complete {
-					return 0, false
+					return 0, 0, false
 				}
 				i = end - 1
 			case '{', '[':
 				depth++
+				maxDepth = max(maxDepth, depth)
 			case '}', ']':
 				depth--
 				if depth == 0 {
-					return i + 1, true
+					return i + 1, maxDepth, true
 				}
 			}
 		}
-		return 0, false
+		return 0, 0, false
 	default:
 		for i := start; i < len(buf); i++ {
 			switch buf[i] {
 			case ',', '}', ']', ' ', '\t', '\n', '\r':
-				return i, true
+				return i, 0, true
 			}
 		}
-		return 0, false
+		return 0, 0, false
 	}
 }
 

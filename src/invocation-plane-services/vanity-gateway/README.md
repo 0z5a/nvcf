@@ -478,7 +478,7 @@ The buffered path is also used when:
 | `model` or `stream` is missing from the prefix. An omitted `stream` is not known to be absent until the body ends. | `late_fields` |
 | The object ends, or more data follows it, before the routing fields | `fields_absent` |
 | A routing field uses a form listed above | `nonstandard_fields` |
-| The prefix is not a JSON object or has a syntax error | `invalid_prefix` |
+| The prefix is not a JSON object, has a syntax error, or nests deeper than the JSON decoders accept | `invalid_prefix` |
 | `multipart/form-data` image requests | `multipart` |
 | The model is not routed by the endpoint | `model_not_found` |
 | The model is offline or past `eol` | `function_status` |

@@ -144,6 +144,7 @@ func TestReadModelRequestBodyChoosesPath(t *testing.T) {
 		{"decision route needs only model", decisionsPath, "application/json", earlyBody(`{"model":"`+prefixTestModel+`"`, large), streamedBodyRead(), prefixTestModel, false},
 		{"decision route ignores stream type", decisionsPath, "application/json", earlyBody(`{"stream":"yes","model":"`+prefixTestModel+`"`, large), streamedBodyRead(), prefixTestModel, false},
 		{"messages route", "/v1/messages", "application/json", earlyBody(`{"model":"`+prefixTestModel+`","stream":true`, large), streamedBodyRead(), prefixTestModel, true},
+		{"member nested within the decoder limit", "/v1/chat/completions", "", earlyBody(`{"x":`+nestedArray(9999)+`,"model":"`+prefixTestModel+`","stream":true`, large), streamedBodyRead(), prefixTestModel, true},
 
 		{"complete small body", "/v1/chat/completions", "", `{"model":"` + prefixTestModel + `","stream":true}`, bufferedBodyRead(requestBodyReasonComplete), prefixTestModel, true},
 		{"known length of exactly the prefix", "/v1/chat/completions", "", exactPrefixBody(), bufferedBodyRead(requestBodyReasonComplete), prefixTestModel, true},
@@ -193,6 +194,13 @@ func exactPrefixBody() string {
 	return head + filler(requestPrefixLimit-len(head)-2) + `"}`
 }
 
+// nestedArray returns an empty array nested depth levels deep. The JSON
+// decoders accept 10000 levels in a document, and the top-level object is one
+// of them, so a member may nest 9999 levels.
+func nestedArray(depth int) string {
+	return strings.Repeat("[", depth) + strings.Repeat("]", depth)
+}
+
 func largeMultipartModelBody(t *testing.T, model string, fileSize int) (string, string) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -225,6 +233,7 @@ func TestReadModelRequestBodyKeepsCompleteBodyErrors(t *testing.T) {
 		{"truncated literal", earlyBody(`{"model":"`+prefixTestModel+`","stream":tru`, large), errInvalidJSONBody},
 		{"null body", " null" + strings.Repeat(" ", large), errInvalidJSONBody},
 		{"model missing", `{"input":"` + filler(large) + `"}`, errModelFieldMissing},
+		{"member nested past the decoder limit", earlyBody(`{"x":`+nestedArray(10000)+`,"model":"`+prefixTestModel+`","stream":true`, large), errInvalidJSONBody},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
