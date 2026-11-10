@@ -276,4 +276,18 @@ class AuthzServiceTest {
         assertNotNull(response);
     }
 
+
+    @Test
+    void evaluatePolicy_usesNcaIdFromIntrospection() throws Exception {
+        var introspectionResponse = jsonMapper.readValue("""
+                {"authorizations": {"policies": [{"aud": "%s"}]}}
+                """.formatted(NVCF_SERVICE_ID), IntrospectionResponse.class)
+                .toBuilder().ncaId("stored-nca-id").build();
+
+        AuthzResponse.Result response =
+                authzService.evaluatePolicy(NVCF_SERVICE_ID, introspectionResponse, "apikey.allow");
+
+        assertEquals("stored-nca-id", response.getNcaId());
+        assertEquals("stored-nca-id", response.getOwnerNcaId());
+    }
 }

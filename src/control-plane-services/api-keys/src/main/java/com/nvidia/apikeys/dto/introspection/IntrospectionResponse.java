@@ -17,6 +17,7 @@
 
 package com.nvidia.apikeys.dto.introspection;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.PropertyNamingStrategies;
 import tools.jackson.databind.annotation.JsonNaming;
@@ -32,6 +33,8 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
 public class IntrospectionResponse {
+    @JsonIgnore
+    private String ncaId;
     private KeyOwnerType ownerType;
     private String ownerId;
     private String keyId;
