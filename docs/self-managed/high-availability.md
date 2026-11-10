@@ -177,7 +177,9 @@ safely.)
 > advertises its own address in the work message: grpc-proxy its Pod IP, and
 > invocation-service `<dashed-pod-ip>.invocation.nvcf.svc.cluster.local`, which
 > cluster DNS resolves to that pod. Workers in the same cluster reach that
-> address directly, so no proxy and no DNS change are needed.
+> address directly, so no proxy and no DNS change are needed. Workers in
+> another cluster cannot reach pod addresses; they need the
+> [Worker Callback Proxy](./worker-callback-proxy.md).
 >
 > The invocation-service name is a CoreDNS endpoint record, which CoreDNS
 > answers by default. It does not resolve if CoreDNS has `endpoint_pod_names`
@@ -193,7 +195,9 @@ safely.)
 > request. When one is set, the affected service stays at **a single replica**
 > under HA with its HPA disabled, keeps hostname anti-affinity and zone spread
 > (no-ops at one replica), and gets **no HA PDB** (a `minAvailable: 1` PDB on a
-> singleton would block node drains).
+> singleton would block node drains). grpc-proxy with HTTP/3 enabled
+> (`grpcproxy.http3.enabled`, or the worker callback proxy) is the exception:
+> each pod puts its own IP in front of the base URL, so it still scales.
 >
 > If you enable the HPA (`invocation.autoscaling.enabled` or
 > `grpcproxy.deployment.autoscaling.enabled`), HA raises its `minReplicas` to 2
@@ -344,6 +348,28 @@ The control-plane services default to `LOCAL_QUORUM` consistency, and some
   [Zone spread for the quorum services](#zone-spread-for-the-quorum-services))
   and does not hold above three pods.
 
+#### Cassandra read retry policy (`RangeReadRetryPolicy`)
+
+When one Cassandra pod dies, index-backed reads (for example listing function
+versions) can fail for a few seconds until the other replicas stop treating
+the dead node as alive. The default `NextHostRetryPolicy` retries a read
+timeout on the next replica only when no data came back.
+
+The self-managed `nvcf-api` and `api-keys` services (ncp profile) select
+`RangeReadRetryPolicy`, which also retries once, on the next replica, a read
+timeout that has data but too few responses. This is independent of
+`highAvailability.mode`. To return to the default, or to tune resilience
+further, override the driver retry-policy class through the operator env hooks:
+
+```yaml
+api:
+  env:
+    SPRING_CASSANDRA_ADVANCED_RETRY_POLICY_CLASS: com.nvidia.boot.cassandra.retry.NextHostRetryPolicy
+apikeys:
+  env:
+    SPRING_CASSANDRA_ADVANCED_RETRY_POLICY_CLASS: com.nvidia.boot.cassandra.retry.NextHostRetryPolicy
+```
+
 ## Tuning scheduling policy (`global.affinity` / `global.topologySpreadConstraints`)
 
 Affinity and zone topology spread are shared scheduling policy, so you can
@@ -412,11 +438,13 @@ kubectl -n nvcf get deploy invocation-service grpc-proxy-deployment -o wide
 kubectl -n ess get deploy ess-api-deployment -o wide
 ```
 
-Confirm the JetStream RF took effect (streams report `Replicas: 3`):
+Confirm the JetStream RF took effect (streams report `Replicas: 3`). The NATS
+CLI is in the `nats-box` deployment; the `nats` server container does not
+include it:
 
 ```bash
-kubectl -n nats-system exec -it nats-0 -- nats stream ls
-kubectl -n nats-system exec -it nats-0 -- nats stream info <stream-name>
+kubectl -n nats-system exec deploy/nats-box -- nats stream ls
+kubectl -n nats-system exec deploy/nats-box -- nats stream info <stream-name>
 ```
 
 Confirm Cassandra keyspace replication:
