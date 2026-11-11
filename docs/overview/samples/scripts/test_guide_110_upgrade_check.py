@@ -191,11 +191,21 @@ assert all('fixture-secret' not in a for a in args)
 query = args[-1]
 with open(os.environ['CQL_LOG'], 'a') as log: log.write(json.dumps([os.environ.get('POD'), query]) + '\n')
 if 'system_auth.roles' in query and os.environ.get('FAIL_POD') == os.environ.get('POD'): sys.exit(1)
-if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
+if 'SELECT keyspace_name FROM' in query:
+    for keyspace in os.environ.get('FAKE_KEYSPACES', 'nvcf_api').split(','): print(keyspace)
+if 'FROM system_schema.tables' in query:
+    print(' table_name'); print('------------')
+    for table in os.environ.get('FAKE_LEDGER_TABLES', 'nvcf_api,sis_api').split(','):
+        if table: print(' ' + table)
+    print(''); print('(2 rows)')
+if 'FROM schema_migrations.' in query:
+    table = query.split('schema_migrations.')[1].split(';')[0]
+    if os.environ.get('POD') == os.environ.get('LEDGER_DIVERGE_POD') and table == 'sis_api': sys.exit(0)
+    print(' version | dirty'); print('---------+-------'); print(' 3 | False'); print(''); print('(1 rows)')
 """
 
     def run_block(self, marker_blocks, replicas="1", fail_pod="", datacenter="custom_dc",
-                  ha_mode="preferred", logs_fail="", logs_text="", saved_replicas="same"):
+                  ha_mode="preferred", logs_fail="", logs_text="", saved_replicas="same", extra_env=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "cqlsh").write_text(self.CQLSH)
@@ -210,11 +220,14 @@ if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
                    "CQL_LOG": str(root / "calls"), "STATEFULSET": json.dumps(statefulset),
                    "FAIL_POD": fail_pod, "BACKUP_DIR": str(backup), "CONTROL_STACK": "/stack",
                    "HELMFILE_ENV": "env", "HA_MODE_STUB": ha_mode, "LOGS_FAIL": logs_fail, "LOGS_TEXT": logs_text}
+            env.update(extra_env or {})
             env.pop("CASSANDRA_REPLICAS", None)
             commands = "\n".join(block_containing(UPGRADE_11, marker) for marker in marker_blocks)
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", self.STUBS + commands + "\necho CONTINUED"],
-                                    env=env, input="fixture-secret\n", capture_output=True, text=True)
+                                    env=env, input="fixture-secret\n" * 4, capture_output=True, text=True)
             calls = (root / "calls").read_text() if (root / "calls").exists() else ""
+            ledger = backup / "schema-migrations-ledger.txt"
+            self.ledger = ledger.read_text() if ledger.exists() else None
             return result, calls
 
     SCALE = "scale statefulset cassandra"
@@ -298,6 +311,46 @@ if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
         self.assertNotIn("ALTER KEYSPACE nvct_api", calls)
         self.assertIn("skipping nvct_api: not present", result.stdout)
         self.assertEqual(3, calls.count("nodetool repair --full\n"))
+
+    RECORD = 'LEDGER_TABLES=$(cql_on cassandra-0'
+    VERIFY = 'migration ledger matches on'
+
+    def test_migration_ledger_is_recorded_from_the_original_member(self):
+        result, calls = self.run_block([self.RECORD])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("nvcf_api: 3|False\nsis_api: 3|False\n", self.ledger)
+        self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
+        self.assertIn("CONTINUED", result.stdout)
+
+    def test_recording_the_ledger_stops_when_the_ledger_has_no_tables(self):
+        result, calls = self.run_block([self.RECORD], extra_env={"FAKE_LEDGER_TABLES": ""})
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("CONTINUED", result.stdout)
+
+    def test_migration_ledger_keyspace_is_raised_when_present_and_skipped_when_absent(self):
+        result, calls = self.run_block([self.AUTH, self.APPS],
+                                       extra_env={"FAKE_KEYSPACES": "schema_migrations,nvcf_api"})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("ALTER KEYSPACE schema_migrations WITH replication = {'class': 'NetworkTopologyStrategy', 'custom_dc': '3'}", calls)
+        result, calls = self.run_block([self.AUTH, self.APPS])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn("ALTER KEYSPACE schema_migrations", calls)
+        self.assertIn("skipping schema_migrations: not present", result.stdout)
+
+    def test_ledger_comparison_passes_when_every_member_matches(self):
+        result, calls = self.run_block([self.RECORD, self.AUTH, self.VERIFY])
+        self.assertEqual(0, result.returncode, result.stderr)
+        for pod in ("cassandra-0", "cassandra-1", "cassandra-2"):
+            self.assertIn(f"migration ledger matches on {pod}", result.stdout)
+        self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
+
+    def test_ledger_comparison_stops_when_a_member_is_missing_a_row(self):
+        result, calls = self.run_block([self.RECORD, self.AUTH, self.VERIFY],
+                                       extra_env={"LEDGER_DIVERGE_POD": "cassandra-1"})
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("migration ledger differs on cassandra-1", result.stderr)
+        self.assertNotIn("CONTINUED", result.stdout)
+        self.assertNotIn("migration ledger matches on cassandra-2", result.stdout)
         self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
 
 

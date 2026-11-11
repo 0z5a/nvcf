@@ -163,8 +163,10 @@ silently disable HA.
 > enable HA by setting the mode and applying. The Cassandra chart raises the
 > `system_auth` replication factor in a hook that runs after the StatefulSet
 > scales, and it does not repair the data, so administrator and service logins can
-> fail while every member shows `UN`. Expand and repair Cassandra first, with the
-> steps in [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
+> fail while every member shows `UN`. The migration ledger in the `schema_migrations`
+> keyspace is affected the same way, and a migration job then replays migrations
+> that already ran. Expand and repair Cassandra first, with the steps in
+> [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
 > then apply.
 
 ## What HA changes, by tier
@@ -541,7 +543,7 @@ in this order:
 
    ```bash
    read -rs -p "Cassandra administrator password: " CASSANDRA_PASSWORD; echo
-   for ks in nvcf_api nvct_api ess_api api_keys_api sis_api event_ledger nvcf_autoscaler; do
+   for ks in schema_migrations nvcf_api nvct_api ess_api api_keys_api sis_api event_ledger nvcf_autoscaler; do
      kubectl -n cassandra-system exec cassandra-0 -- \
        cqlsh -u cassandra -p "$CASSANDRA_PASSWORD" \
        -e "ALTER KEYSPACE $ks WITH replication = {'class': 'NetworkTopologyStrategy', 'ncp': '3'};"
