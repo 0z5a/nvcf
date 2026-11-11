@@ -230,7 +230,7 @@ func (w *WorkerConnection) SetConnection(conn net.Conn) error {
 		}
 		// After an upgrade, ReverseProxy closes the client side as soon as the
 		// worker goes, which would record client_closed. Record the worker as
-		// the cause first, when a read shows it is gone.
+		// the cause first, when a read or write shows it is gone.
 		wrapped.onPeerGone = func() {
 			w.SetCloseOrigin(metrics.CloseReasonWorkerClosed)
 			w.MarkClosed(time.Now())
@@ -345,8 +345,8 @@ type errBox struct{ err error }
 type CloseFuncConn struct {
 	net.Conn
 	onClose func()
-	// onPeerGone runs when a read fails on a connection the proxy has not
-	// closed itself: the worker ended it or stopped answering.
+	// onPeerGone runs when a read or write fails on a connection the proxy has
+	// not closed itself: the worker ended it or stopped answering.
 	onPeerGone func()
 	closing    atomic.Bool
 	// firstErr is the first transport error seen on this connection. Recorded
@@ -359,9 +359,6 @@ type CloseFuncConn struct {
 func (c *CloseFuncConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	c.recordErr(err)
-	if err != nil && c.onPeerGone != nil && !c.closing.Load() {
-		c.onPeerGone()
-	}
 	return n, err
 }
 
@@ -376,6 +373,9 @@ func (c *CloseFuncConn) recordErr(err error) {
 		return
 	}
 	c.firstErr.CompareAndSwap(nil, &errBox{err: err})
+	if c.onPeerGone != nil && !c.closing.Load() {
+		c.onPeerGone()
+	}
 }
 
 // FirstError returns the first transport error seen, or nil if the connection
