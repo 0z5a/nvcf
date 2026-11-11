@@ -200,7 +200,9 @@ func writeRequestTooLargeAfterDispatch(writer http.ResponseWriter, request *http
 		zap.String("function_id", request.Header.Get("function-id")),
 		zap.Int64("limit_bytes", maxBytesErr.Limit),
 	)...)
-	if protocol := proxyErrorProtocol(request); protocol != nativeProtocolNone {
+	// The client's route, not the outgoing path, picks the error shape, as it
+	// does when the limit is reached before dispatch.
+	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
 		status, kind, message := requestReadFailure(protocol, maxBytesErr)
 		writeNativeError(writer, request, status, kind, message)
 		return

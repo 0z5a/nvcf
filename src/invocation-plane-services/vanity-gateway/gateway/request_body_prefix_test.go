@@ -574,6 +574,34 @@ func TestStreamedRequestOverRealTransport(t *testing.T) {
 	assert.Equal(t, sha256.Sum256([]byte(head+tail)), <-result)
 }
 
+// TestRequestTooLargeAfterDispatchFollowsTheClientProtocol checks the error a
+// client gets when its upload passes the limit after dispatch. It must match
+// the client's route, not the outgoing path: a chat route whose outgoing path
+// is /v1/messages still answers in the OpenAI shape.
+func TestRequestTooLargeAfterDispatchFollowsTheClientProtocol(t *testing.T) {
+	tests := []struct {
+		name       string
+		protocol   nativeProtocol
+		wantStatus int
+		wantBody   string
+	}{
+		{"chat route with a messages outgoing path", nativeProtocolNone, http.StatusBadRequest, "Please make sure your payload is below 1048576 bytes"},
+		{"messages route", nativeProtocolMessages, http.StatusRequestEntityTooLarge, "1048576"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, messagesPath, nil)
+			if tc.protocol != nativeProtocolNone {
+				request = withNativeProtocol(request, tc.protocol)
+			}
+			recorder := httptest.NewRecorder()
+			writeRequestTooLargeAfterDispatch(recorder, request, &http.MaxBytesError{Limit: 1 << 20})
+			assert.Equal(t, tc.wantStatus, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), tc.wantBody)
+		})
+	}
+}
+
 // TestStreamedRequestLimitBoundaries covers the route limit on the streamed
 // path. A declared length over the limit is rejected before dispatch. An
 // unknown length that passes the limit after dispatch fails the upstream body
