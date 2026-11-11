@@ -112,6 +112,14 @@ func bufferedBodyRead(reason string) requestBodyMode {
 // body and the returned body has no raw bytes. On the buffered path
 // request.Body holds the complete body, as before.
 func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (openAIRequestBody, requestBodyMode, error) {
+	if request.Body != nil && d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit && !isShadowRequest(request) {
+		// The body cannot fit the route limit, so fail as reading it would,
+		// without reading or forwarding any of it, multipart included. Shadow
+		// replays are exempt: they never pass through the route limit, and
+		// rewriting their model can make them longer than the primary request.
+		_ = request.Body.Close()
+		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
+	}
 	decode := decodeOpenAIJSONBody
 	needStream := true
 	if isDecisionRoute(request) {
@@ -124,14 +132,6 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 	if request.Body == nil {
 		_, err := readOpenAIRequestBody(request, "json body")
 		return openAIRequestBody{}, requestBodyMode{}, err
-	}
-	if d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit && !isShadowRequest(request) {
-		// The body cannot fit the route limit, so fail as reading it would,
-		// without reading or forwarding any of it. Shadow replays are exempt:
-		// they never pass through the route limit, and rewriting their model
-		// can make them longer than the primary request.
-		_ = request.Body.Close()
-		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
 	}
 
 	prefix := bytebufferpool.Get()

@@ -267,17 +267,23 @@ func TestReadModelRequestBodyDoesNotValidateAfterRouting(t *testing.T) {
 // a Content-Length over the route limit fails with the limit error before any
 // body byte is read.
 func TestReadModelRequestBodyRejectsDeclaredOverLimitWithoutReading(t *testing.T) {
-	director, _ := newPrefixTestDirector(t, 1<<20, http.DefaultTransport)
-	client := newGatedBody(earlyBody(`{"model":"`+prefixTestModel+`","stream":true`, 1<<20), "")
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", client)
-	req.ContentLength = 1<<20 + 1
-	_, mode, err := director.readModelRequestBody(req, director.chatCompletions.modelNameToNVCFUrl)
-	var maxBytesErr *http.MaxBytesError
-	require.ErrorAs(t, err, &maxBytesErr)
-	assert.Equal(t, int64(1<<20), maxBytesErr.Limit)
-	assert.Equal(t, requestBodyMode{}, mode)
-	assert.Zero(t, client.read.Load(), "no body byte may be read")
-	assert.True(t, client.closed.Load(), "the body must be closed")
+	for _, contentType := range []string{"application/json", "multipart/form-data; boundary=bdd"} {
+		t.Run(contentType, func(t *testing.T) {
+			director, _ := newPrefixTestDirector(t, 1<<20, http.DefaultTransport)
+			client := newGatedBody(earlyBody(`{"model":"`+prefixTestModel+`","stream":true`, 1<<20), "")
+			close(client.release) // a read reaches EOF instead of blocking the test
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", client)
+			req.Header.Set(contentTypeHeader, contentType)
+			req.ContentLength = 1<<20 + 1
+			_, mode, err := director.readModelRequestBody(req, director.chatCompletions.modelNameToNVCFUrl)
+			var maxBytesErr *http.MaxBytesError
+			require.ErrorAs(t, err, &maxBytesErr)
+			assert.Equal(t, int64(1<<20), maxBytesErr.Limit)
+			assert.Equal(t, requestBodyMode{}, mode)
+			assert.Zero(t, client.read.Load(), "no body byte may be read")
+			assert.True(t, client.closed.Load(), "the body must be closed")
+		})
+	}
 }
 
 // TestStreamedRequestClientUploadFailureIsClientCanceled fails the client
