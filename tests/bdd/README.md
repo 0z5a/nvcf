@@ -232,7 +232,7 @@ custom server API and does not require every voter to become active.
 export OPENBAO_RAFT_TEST_CONTAINER="nvcf-jwt-ha-$OPENBAO_JWT_TEST_ID"
 docker run -d --name "$OPENBAO_RAFT_TEST_CONTAINER" --network none \
   "$OPENBAO_JWT_TEST_IMAGE"
-cd tests/bdd
+cd "$(git rev-parse --show-toplevel)/tests/bdd"
 go test -run '^TestOpenBaoJWTPluginHA$' -timeout 20m -v
 ```
 
