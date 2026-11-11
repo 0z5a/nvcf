@@ -106,13 +106,38 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: tools/go-toolchain/go.mod
-      - name: Generate isolated preview
+      - name: Publish isolated staging validation
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
-          DOCS_PREVIEW_ID: nvcf-${{ github.run_id }}
-          DOCS_PREVIEW_SKIP_COMMENT: '1'
-          DOCS_PREVIEW_CONFIG: ${{ inputs.preview == 'canonical' && 'fern/docs.yml' || '' }}
+          STAGING_DOCS_URL: nvidia-nvcf-release-1-1-0-validation.docs.buildwithfern.com/nvcf
         run: |
           set -euo pipefail
-          ./tools/ci/preview-docs | tee "$RUNNER_TEMP/docs-preview.log"
-          grep '^Preview URL:' "$RUNNER_TEMP/docs-preview.log" >> "$GITHUB_STEP_SUMMARY"
+          go run -C tools/docs-version-sync . umbrella docs-stage \
+            --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/approved-docs"
+          cp "$RUNNER_TEMP/approved-docs/docs-build-receipt.json" "$RUNNER_TEMP/docs-build-receipt.json"
+          node <<'NODE'
+          const fs = require('fs');
+          const path = process.env.RUNNER_TEMP + '/approved-docs/fern/docs.yml';
+          const url = process.env.STAGING_DOCS_URL;
+          let config = fs.readFileSync(path, 'utf8');
+          if (!config.includes('instances:') || !config.includes('title:')) throw new Error('Missing site config');
+          config = config.replace(/instances:\n[\s\S]*?\ntitle:/, 'instances:\n  - url: ' + url + '\n    multi-source: true\ntitle:');
+          config = config.replace(/canonical-host: .*/, 'canonical-host: "' + url + '"');
+          if (config.includes('custom-domain: docs.nvidia.com')) throw new Error('Refuse production domain');
+          fs.writeFileSync(path, config);
+          fs.copyFileSync(path, process.env.RUNNER_TEMP + '/staging-docs.yml');
+          NODE
+          cd "$RUNNER_TEMP/approved-docs"
+          "$GITHUB_WORKSPACE/tools/ci/run-fern" check
+          "$GITHUB_WORKSPACE/tools/ci/run-fern" generate --docs \
+            --instance "$STAGING_DOCS_URL" --strict-broken-links
+          echo "Staging URL: https://$STAGING_DOCS_URL" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain staging identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: staging-docs-identities
+          path: |
+            ${{ runner.temp }}/docs-build-receipt.json
+            ${{ runner.temp }}/staging-docs.yml
+          if-no-files-found: error
