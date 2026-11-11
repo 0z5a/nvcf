@@ -42,9 +42,10 @@ How `nvstor-peer` works inside. How to use it: [peer-copy.md](peer-copy.md).
 4. **Generations.** The server derives a file's generation from `fstat`
    (device, inode, size, mtime, ctime) before and after every read and
    repeats a read during which it changed. A range whose generation no
-   longer matches the manifest fails with `GENERATION_CHANGED`, and the
-   fetch stops with an error naming the file instead of stitching two
-   versions together.
+   longer matches the manifest fails with `GENERATION_CHANGED`; ranges of two
+   versions are never stitched together. The fetch finishes the file from
+   another source with the same content identity, or, when none is left,
+   stops with an error naming the file ([Several sources](#several-sources-fetch---source----source-)).
 
 ## Fan-out
 

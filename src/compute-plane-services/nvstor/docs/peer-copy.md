@@ -88,12 +88,12 @@ NVSTOR_PEER_SECRET=... nvstor-peer fetch --source SOURCE_IP:9890 \
 | `--no-attrs` | off | Copy bytes only: no modes, mtimes or owners. Files stay 0600 and created directories 0700 (the caller sets modes). Also lets a fetch take a source that runs an older nvstor-peer, which is refused otherwise |
 | `--no-owner` | off | Modes and mtimes, but not owners: the files are the caller's even with CAP_CHOWN (for a user namespace without the ids mapped, or NFS with root_squash, where a chown fails) |
 | `--preserve-setid` | off | Keep set-user-ID and set-group-ID bits of files and directories (dropped by default) |
-
-Which attributes a copy gets, and when an owner or mode counts as
-authoritative: [Attributes](peer-copy-internals.md#attributes).
 | `--json` | off | Print one JSON object on stdout at the end, on failure too; human output goes to stderr (see [Stable interface](#stable-interface)) |
 | `--then-serve` | off | After a complete copy, serve DEST as `--prefix` with the same secret and devices; takes `--port`, `--listen`, `--max-fetchers`, `--slot-mib`, `--slots`, `--max-in-flight` as `serve` does (without `--then-serve` these are refused) |
 | `--gpu N` | off | Land the copy in GPU N's memory first; see [Fetch into GPU memory](#fetch-into-gpu-memory-fetch---gpu-n). `--gpu-mapping`, `--gpu-ready-file` and `--gpu-check` require it |
+
+Which attributes a copy gets, and when an owner or mode counts as
+authoritative: [Attributes](peer-copy-internals.md#attributes).
 
 With `--devices netns` a device belongs to the namespace when its GID is
 an address of an interface here or its netdev is an interface here (same
@@ -366,8 +366,9 @@ Lifetime: with `--gpu-ready-file`, the process holds the GPU memory after
 the JSON line until it is stopped (SIGTERM), also if the disk copy failed
 after the ready file was written (the JSON line says so): a consumer may
 be using it. Without one, nothing can open the memory and the process
-exits. A fetch that cannot copy every listed file is refused before any
-transfer (exit 1): the GPU copy is all or nothing. The JSON line fills
+exits. A fetch that lists files the transport cannot request (paths too
+long for a key) is refused before any transfer (exit 1), because the GPU
+copy is all or nothing. The JSON line fills
 `gpu`, `gpu_bytes` and `gpu_ready_seconds`.
 
 The container needs the CUDA driver library: with the NVIDIA container
