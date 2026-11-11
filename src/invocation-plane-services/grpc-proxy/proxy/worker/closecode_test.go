@@ -180,6 +180,29 @@ func TestCloseFuncConnRecordsFirstError(t *testing.T) {
 	}
 }
 
+// A failed read means the worker went away, unless the proxy had already
+// closed the connection itself.
+func TestCloseFuncConnReportsWorkerGoneUntilClosed(t *testing.T) {
+	proxyEnd, workerEnd := net.Pipe()
+	gone := 0
+	fc := &CloseFuncConn{Conn: proxyEnd, onClose: func() {}, onPeerGone: func() { gone++ }}
+	buf := make([]byte, 1)
+
+	_ = workerEnd.Close()
+	if _, err := fc.Read(buf); err == nil {
+		t.Fatal("read succeeded after the worker closed its end")
+	}
+	if gone != 1 {
+		t.Fatalf("worker gone reported %d times, want 1", gone)
+	}
+
+	_ = fc.Close()
+	_, _ = fc.Read(buf)
+	if gone != 1 {
+		t.Error("a read failing after the proxy closed the connection was blamed on the worker")
+	}
+}
+
 func TestCloseFuncConnNoErrorWhenClean(t *testing.T) {
 	fc := &CloseFuncConn{Conn: &stubConn{}, onClose: func() {}}
 	if _, err := fc.Write([]byte("x")); err != nil {
