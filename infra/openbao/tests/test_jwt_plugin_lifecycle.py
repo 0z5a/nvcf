@@ -25,13 +25,22 @@ from pathlib import Path
 path = Path(os.environ["FAKE_BAO_STATE"])
 state = json.loads(path.read_text())
 args = sys.argv[1:]
-if state.get("fail_reads") and args[:2] in (["secrets", "list"], ["plugin", "info"]):
+if state.get("fail_reads"):
+    sys.exit(2)
+if args[:2] == ["plugin", "list"] and state.get("catalog_list_failures", 0):
+    state["catalog_list_failures"] -= 1
+    path.write_text(json.dumps(state))
     sys.exit(2)
 if args[:2] == ["plugin", "info"] and state.get("not_ready_reads", 0):
     state["not_ready_reads"] -= 1
     path.write_text(json.dumps(state))
     sys.exit(2)
-if args[:2] == ["secrets", "list"]:
+if args[:1] == ["status"]:
+    print(json.dumps(state.get("health", {"initialized": True, "sealed": False, "ha_enabled": False})))
+elif args[:2] == ["plugin", "list"]:
+    print(json.dumps(state.get("catalog_response", {"details": [
+        {"name": "vault-plugin-secrets-jwt", **entry} for entry in state["catalog"].values()]})))
+elif args[:2] == ["secrets", "list"]:
     print(json.dumps(state["mounts"]))
 elif args[:2] == ["plugin", "info"]:
     version = next((x.split("=", 1)[1] for x in args if x.startswith("-version=")), "")
@@ -130,6 +139,13 @@ class LifecycleTest(unittest.TestCase):
         self.mount()["running_plugin_version"] = version
         self.mount()["running_sha256"] = self.state["catalog"][version]["sha256"]
 
+    def target_only(self):
+        self.output = self.root / "target-only"
+        self.env.update(JWT_INCLUDE_LEGACY="false", JWT_PACKAGE_OUTPUT=str(self.output),
+                        JWT_PLUGIN_DIR=str(self.output / "plugins"),
+                        JWT_PLUGIN_CONFIG_DIR=str(self.output / "plugin-config"))
+        self.package()
+
     def test_bridge_preserves_bytes_and_architecture_specific_hashes(self):
         self.assertEqual((self.output / "plugins" / PLUGIN).read_bytes(), self.legacy.read_bytes())
         config = (self.output / "plugin-config/jwt.hcl").read_text()
@@ -163,8 +179,7 @@ class LifecycleTest(unittest.TestCase):
         self.run_driver("verify")
         self.run_driver("check-cleanup")
         self.run_driver("cleanup", success=False)
-        (self.output / "plugins" / PLUGIN).unlink()
-        (self.output / "plugins" / f"{PLUGIN}-{OLD}").unlink()
+        self.target_only()
         self.run_driver("cleanup")
         self.assertEqual(set(self.state["catalog"]), {TARGET})
         self.assertIn("auth-like-jwt/", self.state["mounts"])
@@ -237,8 +252,7 @@ class LifecycleTest(unittest.TestCase):
         self.run_driver("deployment-preflight")
         self.mount()["plugin_version"] = TARGET
         self.reload()
-        (self.output / "plugins" / PLUGIN).unlink()
-        (self.output / "plugins" / f"{PLUGIN}-{OLD}").unlink()
+        self.target_only()
         self.run_driver("deployment-preflight")
         self.mount()["running_plugin_version"] = OLD
         self.run_driver("deployment-preflight", success=False)
@@ -247,6 +261,45 @@ class LifecycleTest(unittest.TestCase):
     def test_digest_identifies_a_mount_with_an_unexpected_type(self):
         self.mount()["type"] = "unexpected-alias"
         self.run_driver("cleanup", success=False)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_recovery_bridge_deployment_accepts_only_verified_post_removal_state(self):
+        self.mount()["plugin_version"] = TARGET
+        self.reload()
+        self.state["catalog"] = {TARGET: self.state["catalog"][TARGET]}
+        self.run_driver("deployment-preflight")
+        for configured, running, sha in ((OLD, TARGET, self.target_sha),
+                                         (TARGET, OLD, self.old_sha),
+                                         ("", TARGET, self.target_sha),
+                                         (TARGET, TARGET, self.old_sha)):
+            with self.subTest(configured=configured, running=running, sha=sha):
+                self.mount().update(plugin_version=configured, running_plugin_version=running,
+                                    running_sha256=sha)
+                self.run_driver("deployment-preflight", success=False)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_recovery_bridge_does_not_accept_partial_or_mismatched_catalog(self):
+        self.mount()["plugin_version"] = TARGET
+        self.reload()
+        target_entry = self.state["catalog"][TARGET]
+        old_entry = self.state["catalog"][OLD]
+        rejected_catalogs = (
+            {TARGET: target_entry, "": self.state["catalog"][""]},
+            {TARGET: target_entry, OLD: {**old_entry, "sha256": self.target_sha}},
+            {TARGET: {**target_entry, "sha256": self.old_sha}},
+        )
+        for catalog in rejected_catalogs:
+            with self.subTest(catalog=catalog):
+                self.state["catalog"] = catalog
+                self.run_driver("deployment-preflight", success=False)
+        self.state["catalog"] = {TARGET: target_entry, OLD: old_entry}
+        self.run_driver("deployment-preflight")
+        self.assertEqual(self.state["writes"], [])
+
+    def test_target_only_cannot_mistake_unknown_legacy_mount_for_empty_inventory(self):
+        self.target_only()
+        self.mount()["type"] = "unidentified-legacy-alias"
+        self.run_driver("deployment-preflight", success=False)
         self.assertEqual(self.state["writes"], [])
 
     def test_bridge_preflight_checks_legacy_bytes_before_version_registration(self):
@@ -263,17 +316,103 @@ class LifecycleTest(unittest.TestCase):
         self.run_driver("wait-ready", success=False)
         self.assertEqual(self.state["writes"], [])
 
+    def test_ready_check_recovers_from_catalog_list_and_info_failures(self):
+        self.state.update(catalog_list_failures=1, not_ready_reads=1)
+        self.run_driver("wait-ready")
+        self.assertEqual(self.state["catalog_list_failures"], 0)
+        self.assertEqual(self.state["not_ready_reads"], 0)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_ready_check_catalog_list_failures_have_a_bounded_timeout(self):
+        self.state["catalog_list_failures"] = 5
+        result = self.run_driver("wait-ready", success=False)
+        self.assertEqual(self.state["catalog_list_failures"], 2)
+        self.assertIn("target catalog did not become ready", result.stderr)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_ready_check_rejects_invalid_or_unknown_catalog_without_retrying_info(self):
+        responses = ({}, {"details": None}, {"details": [{
+            "name": PLUGIN, "version": "v99.0.0", "builtin": False,
+        }]})
+        for response in responses:
+            with self.subTest(response=response):
+                self.state.update(catalog_response=response, not_ready_reads=2)
+                result = self.run_driver("wait-ready", success=False)
+                self.assertIn("unavailable or unknown JWT catalog versions", result.stderr)
+                self.assertEqual(self.state["not_ready_reads"], 2)
+                self.assertEqual(self.state["writes"], [])
+
     def test_cleanup_resumes_after_failure_and_handles_missing_entries(self):
         self.mount()["plugin_version"] = TARGET
         self.reload()
-        (self.output / "plugins" / PLUGIN).unlink()
-        (self.output / "plugins" / f"{PLUGIN}-{OLD}").unlink()
+        self.target_only()
         self.state["fail_delete_version"] = ""
         self.run_driver("cleanup", success=False)
         self.assertNotIn(OLD, self.state["catalog"])
         self.run_driver("cleanup")
         self.run_driver("cleanup")
         self.assertEqual(set(self.state["catalog"]), {TARGET})
+
+    def test_unused_unknown_catalog_version_blocks_every_mutation(self):
+        self.state["catalog"]["v99.0.0"] = {
+            "version": "v99.0.0", "command": f"{PLUGIN}-v99.0.0",
+            "builtin": False, "sha256": self.target_sha,
+        }
+        for action in ("pin-old", "upgrade", "rollback", "cleanup", "deployment-preflight"):
+            self.run_driver(action, success=False)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_unavailable_catalog_version_inventory_fails_closed(self):
+        for response in ({}, {"details": None}, {"details": [{"name": PLUGIN}]}):
+            self.state["catalog_response"] = response
+            self.run_driver("deployment-preflight", success=False)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_cleanup_rejects_ha_and_unverifiable_health(self):
+        self.mount()["plugin_version"] = TARGET
+        self.reload()
+        self.target_only()
+        for health in ({}, {"initialized": True, "sealed": False, "ha_enabled": True},
+                       {"initialized": True, "sealed": True, "ha_enabled": False}):
+            self.state["health"] = health
+            self.run_driver("cleanup", success=False)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_target_only_failure_identifies_required_upgrade_stop(self):
+        self.target_only()
+        self.env["JWT_PLUGIN_BRIDGE_IMAGE"] = "bridge.example/release@sha256:" + "1" * 64
+        result = self.run_driver("deployment-preflight", success=False)
+        self.assertIn("Required upgrade stop: bridge.example/release@sha256:", result.stderr)
+        self.assertIn("openbao-jwt-plugin-upgrade.md", result.stderr)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_image_check_rejects_changed_command_with_unchanged_hash(self):
+        config = self.output / "plugin-config/jwt.hcl"
+        config.write_text(config.read_text().replace(f'command = "{PLUGIN}-{TARGET}"',
+                                                    'command = "wrong-command"'))
+        self.run_driver("image-check", success=False)
+
+    def test_image_check_rejects_additional_hidden_declarations(self):
+        (self.output / "plugin-config/.legacy.hcl").write_text('plugin "secret" "unexpected" {}\n')
+        self.run_driver("image-check", success=False)
+
+    def test_target_only_rejects_old_config_and_unexpected_plugin_paths(self):
+        bridge_config = (self.output / "plugin-config/jwt.hcl").read_text()
+        self.target_only()
+        config = self.output / "plugin-config/jwt.hcl"
+        target_config = config.read_text()
+        config.write_text(bridge_config)
+        self.run_driver("image-check", success=False)
+        config.write_text(target_config)
+        (self.output / "plugins" / f"{PLUGIN}-v99.0.0").write_bytes(b"unexpected")
+        self.run_driver("image-check", success=False)
+
+    def test_packaging_does_not_reuse_a_stale_layout(self):
+        self.env["JWT_INCLUDE_LEGACY"] = "false"
+        result = subprocess.run(["sh", str(SOURCE / "scripts/package-jwt-plugins.sh")],
+                                env=self.env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be fresh", result.stderr)
 
     def test_image_check_needs_no_server_and_entrypoint_keeps_required_config(self):
         self.state["fail_reads"] = True
