@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -114,11 +115,20 @@ func (f *fakeRunner) RunWithTTY(ctx context.Context, command string) (harness.Re
 	return f.Run(ctx, command)
 }
 
+// vanityPodCountCommand is the single-cluster Helmfile feature's wait for
+// the old Vanity Gateway pod to finish draining after a restart.
+const vanityPodCountCommand = `/bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'`
+
 // newFakeRunner returns a runner pre-loaded with canned responses for
 // specific commands. Commands not in the map resolve to ExitCode 0
-// with empty streams. Pass nil for an all-zero-exit runner.
+// with empty streams. Pass nil for an all-zero-exit runner. The Vanity
+// Gateway pod count always reports one pod unless a test overrides it.
 func newFakeRunner(canned map[string]harness.Result) *fakeRunner {
-	return &fakeRunner{results: canned, runs: nil, respond: taskLifecycleResponder()}
+	results := map[string]harness.Result{
+		vanityPodCountCommand: {ExitCode: 0, Stdout: "vanity-gateway pods: 1.\n"},
+	}
+	maps.Copy(results, canned)
+	return &fakeRunner{results: results, runs: nil, respond: taskLifecycleResponder()}
 }
 
 // newWiringSuite builds a Suite tailored for the wiring tests: a
