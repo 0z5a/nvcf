@@ -563,12 +563,6 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=vanity-gateway KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
       And I successfully run command "kubectl --context k3d-ncp-local rollout restart deployment/vanity-gateway --namespace nvcf"
       Then deployment "vanity-gateway" in namespace "nvcf" using context "k3d-ncp-local" should complete rollout within "5m"
-      # The old pod keeps serving with the previous mapping during its 70 s
-      # preStop, so wait until only the new pod is left.
-      And I poll command for up to 360 seconds until output contains "vanity-gateway pods: 1.":
-        """
-        /bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'
-        """
       # Decision and replay counters are per pod, and replaced pods keep
       # serving while they drain (up to the 330 s grace period), so wait
       # until only the new pod remains before reading any baseline.
