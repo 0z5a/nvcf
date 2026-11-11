@@ -120,7 +120,20 @@ type StreamDirector struct {
 	functionInvoker FunctionInvoker
 	cors            *cors.Cors
 	eventLedger     *eventledger.Publisher
+	// Request IDs of disconnected sessions being watched for their end. See
+	// watchSessionEnd.
+	sessionWatches sync.Map
+	sessionEndPoll time.Duration
+	watchCtx       context.Context
+	stopWatches    context.CancelFunc
 }
+
+// How often a disconnected session is checked for whether it can still be
+// rejoined, and how long it is watched at most.
+const (
+	defaultSessionEndPoll = 10 * time.Second
+	sessionEndWatchLimit  = 9 * time.Hour
+)
 
 var errShuttingDown = errors.New("proxy is shutting down")
 
@@ -318,6 +331,9 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 
 		if event, ok := attachmentEndEvent(wc, reasonStr, closedAt, heldFor, closeInfo.Code); ok && director != nil {
 			director.eventLedger.Publish(ctx, event)
+			if reasonStr == metrics.CloseReasonClientClosed {
+				director.watchSessionEnd(wc)
+			}
 		}
 
 		// Purge here rather than when a request is cancelled. This fires once
@@ -354,6 +370,8 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 		functionInvoker: functionInvoker,
 		cors:            cors.New(middleware.DefaultCorsOptions),
 	}
+	director.sessionEndPoll = defaultSessionEndPoll
+	director.watchCtx, director.stopWatches = context.WithCancel(context.Background())
 	// Closed over by the eviction handler above, which runs before this
 	// returns only if an entry is evicted during construction, which cannot
 	// happen: the cache is empty until the director serves a request.
@@ -573,6 +591,7 @@ func (s *StreamDirector) purgePendingWork() {
 }
 
 func (s *StreamDirector) Close() error {
+	s.stopWatches()
 	// Mark first: DeleteAll evicts every entry, and without this those
 	// evictions would be misreported as client or worker initiated.
 	s.shuttingDown.Store(true)
@@ -932,4 +951,42 @@ func GrpcCodeToHttpStatusCode(code grpcCodes.Code) int {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusInternalServerError
+}
+
+type sessionResumer interface {
+	SessionResumable(ctx context.Context, requestId uuid.UUID) (bool, error)
+}
+
+// watchSessionEnd reports Session.Ended once the session wc belonged to can no
+// longer be rejoined. A client that left may still come back, so the proxy
+// asks the session registration, which the worker removes when it stops
+// waiting for the client.
+func (s *StreamDirector) watchSessionEnd(wc *worker.WorkerConnection) {
+	resumer, ok := s.functionInvoker.(sessionResumer)
+	if !ok || s.eventLedger == nil {
+		return
+	}
+	if _, watching := s.sessionWatches.LoadOrStore(wc.RequestId, struct{}{}); watching {
+		return
+	}
+	go func() {
+		defer s.sessionWatches.Delete(wc.RequestId)
+		ctx, cancel := context.WithTimeout(s.watchCtx, sessionEndWatchLimit)
+		defer cancel()
+		ticker := time.NewTicker(s.sessionEndPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			resumable, err := resumer.SessionResumable(ctx, wc.RequestId)
+			if err != nil || resumable {
+				continue
+			}
+			s.eventLedger.Publish(ctx, newSessionEnded(wc, time.Now()))
+			return
+		}
+	}()
 }
