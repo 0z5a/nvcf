@@ -374,11 +374,7 @@ async fn start_capturing_chat_backend(retryable_rejection: bool) -> CapturingCha
                     bodies.lock().expect("body capture poisoned").push(body);
                     if retryable_rejection {
                         let mut response = Response::new(Body::from(r#"{"error":"queue full"}"#));
-                        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                        response.headers_mut().insert(
-                            HeaderName::from_static("x-stargate-upstream-retryable"),
-                            HeaderValue::from_static("true"),
-                        );
+                        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                         return response;
                     }
                     Response::builder()
@@ -793,11 +789,7 @@ async fn start_retryable_rejecting_inst() -> (std::net::SocketAddr, String, Quic
             "/v1/chat/completions",
             post(|_req: Request| async move {
                 let mut response = Response::new(Body::from(r#"{"error":"queue full"}"#));
-                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                response.headers_mut().insert(
-                    HeaderName::from_static("x-stargate-upstream-retryable"),
-                    HeaderValue::from_static("true"),
-                );
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                 response
             }),
         )
@@ -1449,7 +1441,7 @@ async fn exercise_reverse_retryable_rejection(protocol: TunnelTransportProtocol)
         &model,
         &reject_id,
         &success_id,
-        "upstream_admission_rejected",
+        "upstream_unavailable",
         2.0,
     );
 
@@ -2665,7 +2657,11 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
         .await
         .expect("budget-limited request failed");
 
-        if budget_limited_resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        // Only a response from the rejecting backend counts: Stargate also
+        // answers 503 while no backend is ready.
+        if budget_limited_resp.status() == StatusCode::SERVICE_UNAVAILABLE
+            && reject_backend.hits() > 0
+        {
             assert!(
                 budget_limited_resp
                     .headers()
@@ -2681,7 +2677,7 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
             );
             assert_metric_sample(
                 &metrics,
-                r#"stargate_proxy_retry_exhausted_total{model="retry-model",reason="upstream_admission_rejected",routing_key=""}"#,
+                r#"stargate_proxy_retry_exhausted_total{model="retry-model",reason="upstream_unavailable",routing_key=""}"#,
                 false,
                 "budget exhaustion should not also count upstream reason",
             );
@@ -2729,11 +2725,11 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
     let metrics = fixture.metrics();
     for (sample, context) in [
         (
-            r#"stargate_proxy_retries_total{model="retry-model",reason="upstream_admission_rejected",routing_key=""}"#,
+            r#"stargate_proxy_retries_total{model="retry-model",reason="upstream_unavailable",routing_key=""}"#,
             "missing retry counter",
         ),
         (
-            r#"stargate_proxy_attempts_total{inference_server_id="retry-reject",model="retry-model",result="upstream_429",routing_key=""}"#,
+            r#"stargate_proxy_attempts_total{inference_server_id="retry-reject",model="retry-model",result="upstream_503",routing_key=""}"#,
             "missing rejecting attempt counter",
         ),
         (
@@ -2741,7 +2737,7 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
             "missing success attempt counter",
         ),
         (
-            r#"stargate_requests_total{inference_server_id="retry-reject",model="retry-model",routing_key="",status="429"} 1"#,
+            r#"stargate_requests_total{inference_server_id="retry-reject",model="retry-model",routing_key="",status="503"} 1"#,
             "hidden retryable attempt should not increment request counter",
         ),
         (
@@ -3189,7 +3185,7 @@ async fn chunked_replay_overflow_records_413_request_metric() {
         let metrics = fixture.metrics();
         if resp.status() == StatusCode::PAYLOAD_TOO_LARGE
             && metrics.contains(
-                r#"stargate_proxy_attempts_total{inference_server_id="chunk-overflow-reject",model="chunk-overflow-model",result="upstream_429",routing_key=""}"#,
+                r#"stargate_proxy_attempts_total{inference_server_id="chunk-overflow-reject",model="chunk-overflow-model",result="upstream_503",routing_key=""}"#,
             )
         {
             assert!(
@@ -3214,9 +3210,31 @@ async fn chunked_replay_overflow_records_413_request_metric() {
 #[tokio::test]
 async fn retryable_single_backend_exhausts_eligible_backends() {
     let mut fixture = ProxyFixture::start("test-sg-retry-single-exhaust").await;
-    fixture
-        .add_retryable_backend("single-reject", "single-exhaust-model")
-        .await;
+    // The rejection must be Pylon's own. For a model server error, the client
+    // gets the model server response when no cluster is left.
+    let (upstream_addr, upstream) = start_health_only_backend().await;
+    let mut config = QuicHttpTunnelConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        format!("http://{upstream_addr}"),
+    );
+    config.forwarding.retry.local_connect_failures_retryable = true;
+    let tunnel = start_quic_http_tunnel(config)
+        .await
+        .expect("single reject tunnel failed to start");
+    fixture.register(
+        active_registration_config(
+            fixture.grpc_addr,
+            "single-reject",
+            format!("quic://{}", tunnel.listen_addr()),
+            format!("http://{upstream_addr}"),
+            "single-exhaust-model",
+        ),
+        "registration failed",
+    );
+    fixture.own_tunnel(tunnel);
+    fixture.wait_for_clusters("single-exhaust-model", 1).await;
+    upstream.abort();
+    let _ = upstream.await;
 
     let metrics = poll_until(
         "single retryable backend should exhaust eligible backends",
@@ -3229,7 +3247,7 @@ async fn retryable_single_backend_exhausts_eligible_backends() {
                 let metrics = metrics_text(registry);
                 (response.status() == StatusCode::SERVICE_UNAVAILABLE
                     && metrics.contains(
-                        r#"stargate_proxy_attempts_total{inference_server_id="single-reject",model="single-exhaust-model",result="upstream_429",routing_key=""}"#,
+                        r#"stargate_proxy_attempts_total{inference_server_id="single-reject",model="single-exhaust-model",result="upstream_503",routing_key=""}"#,
                     ))
                 .then_some(metrics)
             }
@@ -3273,7 +3291,7 @@ async fn backend_error_before_output_is_retried_on_an_untried_instance() {
         ("server_error_500", Dynamo, 500, DYNAMO_SERVER_ERROR_BODY, None),
         ("bad_gateway_502", Dynamo, 502, GENERIC_ERROR_BODY, None),
         ("gateway_timeout_504", Dynamo, 504, GENERIC_ERROR_BODY, None),
-        ("unsignalled_429", Dynamo, 429, GENERIC_ERROR_BODY, None),
+        ("rate_limited_429", Dynamo, 429, GENERIC_ERROR_BODY, None),
     ];
     let model = "backend-error-model";
     for &(label, upstream_backend, status, body, retry_reason) in cases {
@@ -3621,7 +3639,7 @@ async fn retryable_application_errors_preserve_response_after_retries_stop() {
                 "127.0.0.1:0".parse().unwrap(),
                 format!("http://{upstream_addr}"),
             );
-            config.forwarding.retry.require_upstream_retry_header = false;
+            config.forwarding.retry.retryable_upstream_status_codes = vec![status];
             let tunnel = start_quic_http_tunnel(config)
                 .await
                 .expect("start application error tunnel");
@@ -3662,12 +3680,12 @@ async fn retryable_application_errors_preserve_response_after_retries_stop() {
             assert_delta!(
                 &before, &after, "stargate_proxy_retries_total", if budget.is_some() { 0.0 } else { 1.0 };
                 r#"model="application-error-model""#,
-                r#"reason="upstream_admission_rejected""#
+                r#"reason="upstream_unavailable""#
             );
             let reason = if budget.is_some() {
                 "retry_budget_exhausted"
             } else {
-                "upstream_admission_rejected"
+                "upstream_unavailable"
             };
             assert_delta!(
                 &before, &after, "stargate_proxy_retry_exhausted_total", 1.0;
@@ -3688,12 +3706,13 @@ async fn request_retry_limit_returns_last_retryable_rejection() {
         ..ProxyRetryConfig::default()
     };
     let mut fixture = ProxyFixture::start_with_retry("test-sg-request-retry-limit", retry).await;
-    fixture
-        .add_retryable_backend("retry-limit-a", "retry-limit-model")
-        .await;
-    fixture
-        .add_retryable_backend("retry-limit-b", "retry-limit-model")
-        .await;
+    // The third backend stays untried, so the retry limit ends the request.
+    for backend_id in ["retry-limit-a", "retry-limit-b", "retry-limit-c"] {
+        fixture
+            .add_retryable_backend(backend_id, "retry-limit-model")
+            .await;
+    }
+    fixture.wait_for_clusters("retry-limit-model", 3).await;
 
     let response = poll_until(
         "request retry limit should preserve the upstream rejection",
@@ -3702,7 +3721,7 @@ async fn request_retry_limit_returns_last_retryable_rejection() {
             let request = fixture.chat_request("retry-limit-model", "req-retry-limit");
             async move {
                 let response = request.send().await.expect("request failed");
-                (response.status() == StatusCode::TOO_MANY_REQUESTS).then_some(response)
+                (response.status() == StatusCode::SERVICE_UNAVAILABLE).then_some(response)
             }
         },
     )
@@ -3710,12 +3729,19 @@ async fn request_retry_limit_returns_last_retryable_rejection() {
     assert!(response.headers().get("x-stargate-retryable").is_none());
     let body: serde_json::Value = response.json().await.expect("read upstream rejection body");
     assert_eq!(body, serde_json::json!({"error": "queue full"}));
-    assert_metric_sample(
-        &fixture.metrics(),
-        r#"stargate_proxy_retry_exhausted_total{model="retry-limit-model",reason="upstream_admission_rejected",routing_key=""} 1"#,
-        true,
-        "missing request retry exhausted metric",
-    );
+    let metrics = fixture.metrics();
+    for (sample, context) in [
+        (
+            r#"stargate_proxy_retries_total{model="retry-limit-model",reason="upstream_unavailable",routing_key=""} 1"#,
+            "the request should retry once",
+        ),
+        (
+            r#"stargate_proxy_retry_exhausted_total{model="retry-limit-model",reason="upstream_unavailable",routing_key=""} 1"#,
+            "missing request retry exhausted metric",
+        ),
+    ] {
+        assert_metric_sample(&metrics, sample, true, context);
+    }
 
     fixture.shutdown().await;
 }

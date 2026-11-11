@@ -20,10 +20,8 @@ use pylon_lib::{
     EngineStatsStreamMode, ModelDiscoveryProvider, TunnelTransportProtocol, UpstreamBackend,
 };
 use stargate_protocol::BackendConnectivity;
-use stargate_protocol::tunnel_contract::HEADER_STARGATE_UPSTREAM_RETRYABLE;
 
-const DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES: &str = "429,503";
-const DEFAULT_PYLON_UPSTREAM_RETRY_HEADER: &str = HEADER_STARGATE_UPSTREAM_RETRYABLE;
+const DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES: &str = "529,503";
 const DEFAULT_OTEL_SERVICE_NAME: &str = "pylon";
 
 mod startup;
@@ -167,9 +165,10 @@ struct Args {
         value_name = "NAME"
     )]
     otel_service_name: String,
-    /// Comma-separated upstream HTTP statuses that can be marked retryable.
-    /// Pylon always marks 529 and 503, and in the dynamo backend mode a 404
-    /// with content-length 0.
+    /// Comma-separated upstream HTTP statuses that Pylon marks retryable, for
+    /// every response with that status. An empty value turns these retries
+    /// off. The dynamo backend mode also marks a 404 with content-length 0;
+    /// this list does not control that rule.
     #[arg(
         long,
         default_value = DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -177,23 +176,6 @@ struct Args {
         value_name = "CODES"
     )]
     pylon_retryable_upstream_status_codes: String,
-    /// Require the upstream retry header before marking retryable statuses
-    /// retryable. The responses that Pylon always marks do not need the header.
-    #[arg(
-        long,
-        action = clap::ArgAction::Set,
-        default_value_t = true,
-        env = "PYLON_REQUIRE_UPSTREAM_RETRY_HEADER"
-    )]
-    pylon_require_upstream_retry_header: bool,
-    /// Upstream response header that authorizes retrying retryable status codes
-    #[arg(
-        long,
-        default_value = DEFAULT_PYLON_UPSTREAM_RETRY_HEADER,
-        env = "PYLON_UPSTREAM_RETRY_HEADER",
-        value_name = "HEADER"
-    )]
-    pylon_upstream_retry_header: String,
     /// Convert upstream Retry-After responses into x-stargate-retry-after-ms
     #[arg(
         long,
@@ -318,7 +300,6 @@ mod tests {
         EngineStatsStreamMode, ModelDiscoveryProvider, PylonQueueMismatchRetryConfig,
         PylonRetryConfig, TunnelForwardingConfig, TunnelTransportProtocol,
     };
-    use reqwest::header::HeaderName;
 
     use super::startup::{
         effective_cluster_id, normalize_base_url, pylon_queue_mismatch_retry_config_from_args,
@@ -466,11 +447,6 @@ mod tests {
             retry.retryable_upstream_status_codes,
             defaults.retryable_upstream_status_codes
         );
-        assert_eq!(
-            retry.require_upstream_retry_header,
-            defaults.require_upstream_retry_header
-        );
-        assert_eq!(retry.upstream_retry_header, defaults.upstream_retry_header);
         assert_eq!(retry.propagate_retry_after, defaults.propagate_retry_after);
         assert_eq!(
             retry.local_connect_failures_retryable,
@@ -483,9 +459,6 @@ mod tests {
         let args = parse_argv(&[
             "--pylon-retryable-upstream-status-codes",
             "418, 429,503",
-            "--pylon-require-upstream-retry-header=false",
-            "--pylon-upstream-retry-header",
-            "x-can-retry",
             "--pylon-propagate-retry-after=false",
             "--pylon-local-connect-failures-retryable=true",
         ]);
@@ -498,11 +471,6 @@ mod tests {
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
             ]
-        );
-        assert!(!retry.require_upstream_retry_header);
-        assert_eq!(
-            retry.upstream_retry_header,
-            HeaderName::from_static("x-can-retry")
         );
         assert!(!retry.propagate_retry_after);
         assert!(retry.local_connect_failures_retryable);

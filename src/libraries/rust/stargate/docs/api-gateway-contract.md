@@ -250,38 +250,46 @@ By default it does so only when its local queue estimate exceeds Stargate's by
 at least 10 s and at least 4 times (`--pylon-queue-mismatch-min-delta-ms`,
 `--pylon-queue-mismatch-tolerance-factor`). Stargate's estimate lags behind
 Pylon's under load, so smaller differences are expected.
-The local upstream may mark `429` or `503` retryable for pylon with
-`x-stargate-upstream-retryable: true`; pylon converts that to Stargate retry
-metadata and does not forward the upstream header downstream.
 
-Pylon also marks these model server errors retryable without that header,
-because it classifies the response head before any output reaches Stargate.
-`--pylon-retryable-upstream-status-codes` and
-`--pylon-require-upstream-retry-header` do not change this list.
+Pylon marks a model server error retryable by one rule. It classifies the
+response head before any output reaches Stargate. The list is
+`--pylon-retryable-upstream-status-codes` (default `529,503`). The first row
+that matches gives the reason.
 
 | Upstream response | `x-stargate-retry-reason` | Pylon backend mode |
 | --- | --- | --- |
-| `529` | `upstream_overloaded` | Every mode |
-| `503` | `upstream_unavailable` | Every mode |
+| `529`, when the list has `529` | `upstream_overloaded` | Every mode |
 | `404` with `content-length: 0` | `upstream_model_unregistered` | `dynamo` only |
+| Each other status in the list | `upstream_unavailable` | Every mode |
+
+Pylon marks every response that has a listed status. Do not add `404` or
+`500` to the list: these responses can come from the request itself, so a
+different instance can fail in the same way. `429` is not in the default list,
+because a Dynamo frontend answers `429` for caller limits and queue deadlines.
+Add `429` only for a model server that answers `429` when it is overloaded. An
+empty list turns the status retries off.
 
 A Dynamo frontend answers a `404` with `content-length: 0` after the model
 leaves its registry. Pylon marks that response only with
-`--pylon-upstream-backend dynamo` (the default).
+`--pylon-upstream-backend dynamo` (the default). The list does not control
+this row.
 
 Stargate retries each response in the table on a cluster that this request
 has not tried. The limit is `--proxy-max-request-retries` (default 2). A Pylon
 without `--cluster-id` is its own cluster, so the retry goes to a different
 instance.
 
-Pylon does not mark other model server errors in this way. A `500`, a `404`
-with a body, a `502`, and a `504` reach the client unchanged. A `500` can come
-from the request itself, so a different instance can fail in the same way.
+Pylon does not mark other model server errors. With the default list, a
+`429`, a `500`, a `404` with a body, a `502`, and a `504` reach the client
+unchanged.
 
 When no untried cluster is left, or the retries run out, the client gets the
 last model server response unchanged. If every cluster that the request tried
 answered `529`, the client gets `503` with `x-stargate-error-code:
-overloaded_error` instead.
+overloaded_error` instead. A transport failure does not count as an answer:
+after a transport failure and then a `529`, the client also gets the
+`overloaded_error` response. The LLM API gateway returns `529` for that
+response, so its caller gets `529` in both cases.
 
 Known limitation: routing can reject the only untried cluster, for example
 when that cluster has no ready backend. The client then gets the `503` that

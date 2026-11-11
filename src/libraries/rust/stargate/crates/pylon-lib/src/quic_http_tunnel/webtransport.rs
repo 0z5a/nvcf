@@ -286,13 +286,9 @@ mod tests {
     fn webtransport_success_head_keeps_retry_metadata() {
         let retry = PylonRetryConfig::default();
         let mut upstream_headers = HeaderMap::new();
-        upstream_headers.insert(
-            retry.upstream_retry_header.clone(),
-            HeaderValue::from_static("true"),
-        );
         upstream_headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
 
-        let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
         let headers = build_response_headers(
             status,
             &upstream_headers,
@@ -304,14 +300,14 @@ mod tests {
         .expect("WebTransport success headers should build");
         let head = webtransport_response_head(status, headers);
 
-        assert_eq!(head.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(head.status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             header_value(&head.headers, HEADER_STARGATE_RETRYABLE),
             "true"
         );
         assert_eq!(
             header_value(&head.headers, HEADER_STARGATE_RETRY_REASON),
-            "upstream_admission_rejected"
+            "upstream_unavailable"
         );
         assert_eq!(
             header_value(&head.headers, "x-stargate-retry-after-ms"),
