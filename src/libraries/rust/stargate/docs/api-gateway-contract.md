@@ -255,14 +255,14 @@ Pylon marks a model server error retryable from the response head, before any
 output reaches Stargate. By default it marks `529` and `503`
 (`--pylon-retryable-upstream-status-codes`). In `dynamo` backend mode it also
 marks a `404` with `content-length: 0`, which a Dynamo frontend answers after
-the model leaves its registry. Other model server errors, such as `429` and
-`500`, reach the client unchanged.
+the model leaves its registry. By default, other model server errors, such as
+`429` and `500`, reach the client unchanged.
 
 Stargate retries a marked response on a cluster that this request has not
 tried, up to `--proxy-max-request-retries` (default 2). When no untried
 cluster is left or the retries run out, the client gets the last model server
-response. If every cluster that the request tried answered `529`, the client
-gets `503` with `x-stargate-error-code: overloaded_error` instead. The LLM API
+response. If every answer that the request got was a `529`, the client gets
+`503` with `x-stargate-error-code: overloaded_error` instead. The LLM API
 gateway returns that response as `529`.
 
 Queued requests can wait a long time before their first output. Stargate waits
