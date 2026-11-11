@@ -344,6 +344,13 @@ if 'FROM schema_migrations.' in query:
             self.assertIn(f"migration ledger matches on {pod}", result.stdout)
         self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
 
+    def test_ledger_comparison_runs_in_a_new_shell_without_earlier_helpers(self):
+        result, calls = self.run_block([self.RECORD, self.VERIFY])
+        self.assertEqual(0, result.returncode, result.stderr)
+        for pod in ("cassandra-0", "cassandra-1", "cassandra-2"):
+            self.assertIn(f"migration ledger matches on {pod}", result.stdout)
+        self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
+
     def test_ledger_comparison_stops_when_a_member_is_missing_a_row(self):
         result, calls = self.run_block([self.RECORD, self.AUTH, self.VERIFY],
                                        extra_env={"LEDGER_DIVERGE_POD": "cassandra-1"})

@@ -167,7 +167,10 @@ silently disable HA.
 > keyspace is affected the same way, and a migration job then replays migrations
 > that already ran. Expand and repair Cassandra first, with the steps in
 > [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
-> then apply.
+> then apply. Run those steps from the upgrade guide's session, including
+> [Back up persistent state](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#back-up-persistent-state):
+> it defines `kc` and `BACKUP_DIR` and saves the migration ledger that the steps
+> compare against.
 
 ## What HA changes, by tier
 
@@ -539,7 +542,9 @@ in this order:
    unavailable. Once all three Cassandra pods are Ready, raise each application
    keyspace to RF=3, then run a full repair on every member so the new replicas
    receive the existing data. Skip any keyspace your install does not have
-   (the query in [Validation](#validation) lists them):
+   (the query in [Validation](#validation) lists them). The commands use the
+   chart's default data-center name, `ncp`; if you set
+   `cassandra.cluster.datacenter` to another name, use that name instead:
 
    ```bash
    read -rs -p "Cassandra administrator password: " CASSANDRA_PASSWORD; echo
