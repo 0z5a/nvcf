@@ -15,12 +15,14 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 )
 
 // maxObjectBytes is the S3 single-PutObject limit. A segment past this size
@@ -37,6 +39,7 @@ type Client struct {
 	// s3 is nil in dry-run mode: Submit logs the computed bucket, key, and
 	// size instead of calling the store.
 	s3     *s3.Client
+	calls  *swappableTransport
 	bucket string
 	prefix string
 	// source namespaces the object key by uploader instance. Without it, two
@@ -132,17 +135,43 @@ func newClient(cfg config.Config, transport http.RoundTripper) (backend.Client, 
 	if cfg.ObjectStore.Endpoint != "" {
 		options.BaseEndpoint = aws.String(cfg.ObjectStore.Endpoint)
 	}
+	calls := &swappableTransport{base: transport}
+	calls.current.Store(&transport)
 	options.HTTPClient = &http.Client{
-		Transport:     transport,
+		Transport:     calls,
 		CheckRedirect: rejectNonHTTPSRedirect,
 	}
 
 	return &Client{
 		s3:     s3.New(options),
+		calls:  calls,
 		bucket: cfg.ObjectStore.Bucket,
 		prefix: cfg.ObjectStore.KeyPrefix,
 		source: source,
 	}, nil
+}
+
+// UseTransport routes every store call through the core's transport, so
+// each call is a child span with the trace context and is counted, under
+// the operation name "upload". The redirect check and TLS settings stay. A
+// dry run makes no calls, so it ignores the wrapper.
+func (c *Client) UseTransport(wrap telemetry.TransportWrapper) {
+	if c.calls == nil {
+		return
+	}
+	wrapped := wrap("upload", c.calls.base)
+	c.calls.current.Store(&wrapped)
+}
+
+// swappableTransport is the store client's transport, which UseTransport
+// can replace after the client is built.
+type swappableTransport struct {
+	base    http.RoundTripper
+	current atomic.Pointer[http.RoundTripper]
+}
+
+func (t *swappableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return (*t.current.Load()).RoundTrip(req)
 }
 
 // rejectNonHTTPSRedirect replaces http.Client's default redirect policy.
