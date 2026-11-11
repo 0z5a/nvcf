@@ -69,9 +69,13 @@ vanityGateway:
     maxRequestSizeBytes: 67108864
 ```
 
-The gateway holds each model API request body in memory while it routes the
-request. LLM Gateway routes and shadow models add more copies. In one
-in-process test, a single 64 MiB request raised gateway heap use by about
+The gateway holds a model API request body in memory while it routes the
+request, unless the body is larger than 64 KiB and has `model` and `stream`
+first (decision routes: `model`). Then it holds only that prefix and forwards
+the rest as it arrives; see [Request Body Handling](#request-body-handling).
+LLM Gateway routes and shadow models always hold the full body and add more
+copies. In one in-process test, a single 64 MiB request held in full raised
+gateway heap use by about
 224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
 900 MiB with one shadow model. Treat these numbers as examples, not limits.
 When raising this limit, also raise `vanityGateway.resources.limits.memory`.
@@ -480,7 +484,10 @@ flowchart TD
   forwarded, and applies backpressure from the upstream to the client upload.
   The upstream request starts before the upload ends, so a slow upload holds
   the upstream connection for as long as the client takes to send the body.
-  An upload that sends no bytes for 60 seconds ends the request.
+  An upload that sends no bytes for 60 seconds ends the request. The backend
+  reads the body as the client sends it, so a backend whose body read timeout
+  is shorter than a slow upload fails the request; the buffered path delivers
+  the whole body at once.
 
 A body longer than the prefix streams when its top-level JSON object has
 `model`, and outside the decision routes `stream`, within the prefix. Other
@@ -540,7 +547,8 @@ Failures after a streamed request is dispatched:
 - If the upstream has already started its response, the failure ends that
   response.
 - If the upstream answers before reading the whole body, the client receives
-  that response. The rest of the upload is not forwarded.
+  that response. The rest of the upload is not forwarded. A client that has
+  stopped sending receives it when the 60-second limit ends its upload.
 
 ## Invoking OpenAI-compatible Endpoints
 
