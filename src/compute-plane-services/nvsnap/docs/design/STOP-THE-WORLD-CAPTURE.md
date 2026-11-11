@@ -11,6 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 - [Problem](#problem)
 - [Design](#design)
 - [Cost](#cost)
+- [Scaling groups of several replicas](#scaling-groups-of-several-replicas)
 - [Not covered](#not-covered)
 <!-- /toc -->
 
@@ -96,6 +97,36 @@ Large engine buffers in deleted shared-memory files (a vLLM CPU KV-cache tier,
 The first instance of a configuration is out of service for the capture and
 one restore, once per configuration. It should be captured before traffic is
 routed to it (or drained first); its in-flight requests fail otherwise.
+
+## Scaling groups of several replicas
+
+An instance is one replica of a Grove scaling group (one worker group of a
+Dynamo deployment), with the companions it talks to. When the namespace runs
+several such instances (several replicas of one scaling group, or several
+scaling groups such as prefill and decode workers), they all use the same
+companions (one etcd, one NATS, one frontend). A capture of one instance
+would stop companions the others still use, and each instance's restore
+would restore the same companions again. So the agent does not capture or
+restore those instances as groups:
+
+- Admission sums the replicas of the namespace's scaling groups, and counts
+  at least what the pods' replica indexes show. With more than one, GPU
+  ranks and the namespace's companions are admitted cold, to start from the
+  caches. If the count cannot be read while Grove pods are there, they are
+  admitted cold too.
+- Capture is skipped, and checked again just before the instance is held.
+  When the count cannot be read, capture is tried again later.
+- A group restore of such an instance ends before it waits for its
+  placeholders, as not run.
+- A group restore claims each companion placeholder before it restores it
+  (the `nvsnap.io/criu-companion-claimed-by` annotation, written with the
+  pod's `resourceVersion`). A restore that loses a claim to another live
+  leader ends as not run, and ending a restore leaves companions another
+  live leader claimed alone. A claim left by a leader that is gone is taken
+  over.
+
+Capturing every instance of a namespace, with its companions, as one group
+is future work.
 
 ## Not covered
 
