@@ -172,7 +172,9 @@ silently disable HA.
 > `CONTROL_STACK` from [Get the 1.1.5 packages and check artifacts](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#get-the-115-packages-and-check-artifacts),
 > and the migration ledger that
 > [Back up persistent state](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#back-up-persistent-state)
-> saves for the steps to compare against.
+> saves for the steps to compare against. Outside the upgrade, set `CONTROL_STACK`
+> to the stack directory that holds your edited `environments/<environment-name>.yaml`
+> and `HELMFILE_ENV` to that name, so the steps read your selected HA mode.
 
 ## What HA changes, by tier
 
@@ -539,7 +541,8 @@ in this order:
    `enforced`, expand and repair it first with the steps in
    [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first):
    the sync would otherwise scale it and run the migration job before the ledger
-   is repaired. Then run `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
+   is repaired. If a keyspace also replicates to another data center, read the
+   replication-map note in that section first. Then run `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
    Deployments roll with `maxUnavailable: 0` / `maxSurge: 1` (needs headroom for
    one surge pod); quorum services roll one member at a time and keep quorum.
 5. **Raise Cassandra keyspace replication.** The sync scales Cassandra to three
