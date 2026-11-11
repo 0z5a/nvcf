@@ -167,10 +167,12 @@ silently disable HA.
 > keyspace is affected the same way, and a migration job then replays migrations
 > that already ran. Expand and repair Cassandra first, with the steps in
 > [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
-> then apply. Run those steps from the upgrade guide's session, including
-> [Back up persistent state](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#back-up-persistent-state):
-> it defines `kc` and `BACKUP_DIR` and saves the migration ledger that the steps
-> compare against.
+> then apply. Those steps need the setup from the upgrade guide: `kc` and
+> `BACKUP_DIR` from [Set up the session](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#set-up-the-session),
+> `CONTROL_STACK` from [Get the 1.1.5 packages and check artifacts](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#get-the-115-packages-and-check-artifacts),
+> and the migration ledger that
+> [Back up persistent state](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#back-up-persistent-state)
+> saves for the steps to compare against.
 
 ## What HA changes, by tier
 
@@ -533,7 +535,11 @@ in this order:
    labels, and `WaitForFirstConsumer` storage. If the cluster is not ready (or it
    is a single-node install), set `highAvailability.mode: none` to keep the
    current single-replica behavior.
-4. **Apply.** `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
+4. **Apply.** If Cassandra runs a single member and you chose `preferred` or
+   `enforced`, expand and repair it first with the steps in
+   [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first):
+   the sync would otherwise scale it and run the migration job before the ledger
+   is repaired. Then run `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
    Deployments roll with `maxUnavailable: 0` / `maxSurge: 1` (needs headroom for
    one surge pod); quorum services roll one member at a time and keep quorum.
 5. **Raise Cassandra keyspace replication.** The sync scales Cassandra to three
@@ -542,9 +548,12 @@ in this order:
    unavailable. Once all three Cassandra pods are Ready, raise each application
    keyspace to RF=3, then run a full repair on every member so the new replicas
    receive the existing data. Skip any keyspace your install does not have
-   (the query in [Validation](#validation) lists them). The commands use the
-   chart's default data-center name, `ncp`; if you set
-   `cassandra.cluster.datacenter` to another name, use that name instead:
+   (the query in [Validation](#validation) lists them). If you expanded
+   Cassandra first in step 4, these keyspaces are already at RF=3 and running
+   the block again is safe. The commands use the chart's default data-center
+   name, `ncp`; if you set `cassandra.cluster.datacenter` to another name, use
+   that name instead. Each `ALTER` replaces the whole replication map, so if a
+   keyspace also replicates to another data center, keep that entry in the map:
 
    ```bash
    read -rs -p "Cassandra administrator password: " CASSANDRA_PASSWORD; echo
